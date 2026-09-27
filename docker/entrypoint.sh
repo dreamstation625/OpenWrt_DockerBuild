@@ -108,29 +108,10 @@ apply_network() {
     uci -q commit network 2>/dev/null || true
 }
 
-# ---------------------------------------------------------------------------
-# 容器内 Docker 的数据目录
-# ---------------------------------------------------------------------------
-apply_dockerd() {
-    [ -n "${DOCKER_DATA_ROOT:-}" ] || return 0
-
-    mkdir -p "$DOCKER_DATA_ROOT" 2>/dev/null || true
-
-    if [ -f /etc/config/dockerd ]; then
-        uci -q set "dockerd.globals.data_root=${DOCKER_DATA_ROOT}" 2>/dev/null || true
-        uci -q commit dockerd 2>/dev/null || true
-    fi
-    if [ -f /etc/config/dockerman ]; then
-        uci -q set "dockerman.local.daemon_data_root=${DOCKER_DATA_ROOT}" 2>/dev/null || true
-        uci -q commit dockerman 2>/dev/null || true
-    fi
-}
-
 apply_all() {
     apply_system
     apply_luci
     apply_network
-    apply_dockerd
 }
 
 # ---------------------------------------------------------------------------
@@ -169,7 +150,6 @@ seed_volumes() {
     [ -d "$DEFAULTS_DIR" ] || return 0
 
     dirs="${OPENWRT_SEED_DIRS:-/etc/config /etc/openclash /etc/adguardhome /var/lib/adguardhome /etc/mosdns /usr/share/nftables.d /root /var/log}"
-    [ -n "${DOCKER_DATA_ROOT:-}" ] && dirs="${dirs} ${DOCKER_DATA_ROOT}"
 
     for d in $dirs; do
         seed_dir "$d"

@@ -34,7 +34,6 @@ fi
 
 IMAGE="${OPENWRT_IMAGE:-dreamstation625/openwrt:latest}"
 DATA_DIR="${DATA_DIR:-./data}"
-DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-/opt/docker}"
 
 # 冒号分隔：<宿主机子目录> : <容器内路径>
 MAPPINGS=(
@@ -46,7 +45,6 @@ MAPPINGS=(
     "adguardhome-data:/var/lib/adguardhome"
     "mosdns:/etc/mosdns"
     "nftables.d:/usr/share/nftables.d"
-    "docker:${DOCKER_DATA_ROOT}"
     "root:/root"
     "log:/var/log"
 )

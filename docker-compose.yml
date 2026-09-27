@@ -67,7 +67,6 @@ services:
       LAN_GATEWAY: ${LAN_GATEWAY:-192.168.31.1}
       LAN_DNS: ${LAN_DNS:-223.5.5.5 119.29.29.29}
       ROOT_PASSWORD: ${ROOT_PASSWORD:-root}
-      DOCKER_DATA_ROOT: ${DOCKER_DATA_ROOT:-/opt/docker}
 
     # ------------------------------------------------------------------
     # 持久化：插件配置全靠这些卷，不挂的话容器一重建配置就没了
@@ -87,7 +86,7 @@ services:
     # ------------------------------------------------------------------
     volumes:
       # 核心：UCI 配置。绝大多数插件（网络、防火墙、DHCP、MosDNS、
-      # AdGuardHome、OpenClash、Dockerman...）的设置都落在这里
+      # AdGuardHome、OpenClash 等）的设置都落在这里
       - ${DATA_DIR:-./data}/config:/etc/config
 
       # OpenClash：配置、订阅、规则集，体积大，不持久化每次都要重新下载
@@ -106,9 +105,6 @@ services:
 
       # LuCI 防火墙自定义规则页写的 nftables 片段
       - ${DATA_DIR:-./data}/nftables.d:/usr/share/nftables.d
-
-      # 容器内 Docker 的数据目录（镜像、容器、卷都在这里，会很大）
-      - ${DATA_DIR:-./data}/docker:${DOCKER_DATA_ROOT:-/opt/docker}
 
       # root 家目录（部分插件会往里写状态、SSH key 等）
       - ${DATA_DIR:-./data}/root:/root
@@ -157,6 +153,5 @@ networks:
 #   openwrt-adguardhome:
 #   openwrt-mosdns:
 #   openwrt-nftables:
-#   openwrt-docker:
 #   openwrt-log:
 #   openwrt-root:

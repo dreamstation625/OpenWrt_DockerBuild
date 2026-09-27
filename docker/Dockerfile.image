@@ -22,7 +22,7 @@ ARG OPENWRT_VERSION=unknown
 ARG OPENWRT_BRANCH=openwrt-25.12
 
 LABEL org.opencontainers.image.title="openwrt" \
-      org.opencontainers.image.description="OpenWrt x86_64 (${OPENWRT_BRANCH}) - LuCI + Argon + AdGuardHome + MosDNS + OpenClash + Docker" \
+      org.opencontainers.image.description="OpenWrt x86_64 (${OPENWRT_BRANCH}) - LuCI + Argon + AdGuardHome + MosDNS + OpenClash" \
       org.opencontainers.image.version="${OPENWRT_VERSION}" \
       org.opencontainers.image.source="https://github.com/dreamstation625/OpenWrt_DockerBuild"
 
@@ -71,8 +71,7 @@ ENV PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     LAN_NETMASK=255.255.255.0 \
     LAN_GATEWAY=192.168.31.1 \
     LAN_DNS="223.5.5.5 119.29.29.29" \
-    ROOT_PASSWORD=root \
-    DOCKER_DATA_ROOT=/opt/docker
+    ROOT_PASSWORD=root
 
 # OpenWrt 使用 procd 作为 init
 STOPSIGNAL SIGTERM

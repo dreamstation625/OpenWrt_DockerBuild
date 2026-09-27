@@ -5,8 +5,10 @@
 
 - 编译环境、编译过程、部署形态全部容器化
 - 保留原 `build-openwrt.sh` 的全部功能：插件清单、LuCI 中文、Argon 主题、
-  AdGuardHome / MosDNS / OpenClash / Dockerman、LAN 地址 `192.168.31.254`、
+  AdGuardHome / MosDNS / OpenClash、LAN 地址 `192.168.31.254`、
   nftables 自定义规则页等
+- 固件内**不含** Docker（已移除 dockerd / Dockerman）：这台 OpenWrt 本身就跑在
+  Docker 里，容器里再套一层 Docker 只会徒增故障点
 - GitHub Actions 自动构建，**版本号没变就跳过**，变更时才重新编译并推送 Docker Hub
 
 ---
@@ -185,7 +187,7 @@ docker run -d --name openwrt --restart unless-stopped \
   --network openwrt-lan --ip 192.168.31.254 \
   --cap-add NET_ADMIN --cap-add NET_RAW \
   --sysctl net.ipv4.ip_forward=1 \
-  dreamstation625/openwrt:1.0.1
+  dreamstation625/openwrt:1.0.2
 ```
 
 **群晖自己访问不了 `192.168.31.254`**（macvlan 固有行为），要加子接口：
@@ -243,7 +245,6 @@ macvlan 这一层，也不用跟 NAS 耦合（NAS 挂了旁路由不受影响）
 | `LAN_IP` / `LAN_NETMASK` / `LAN_GATEWAY` | `192.168.31.254` 等 | LAN 地址 |
 | `LAN_DNS` | `223.5.5.5 119.29.29.29` | 多个 DNS 用空格分隔 |
 | `ROOT_PASSWORD` | `root` | root 密码 |
-| `DOCKER_DATA_ROOT` | `/opt/docker` | 容器内 Docker 数据目录 |
 | `OPENWRT_SEED_AUTO` | `1` | 挂载目录为空时是否自动用镜像默认配置初始化，`0` 关闭 |
 | `OPENWRT_SEED_DIRS` | 见 compose | 需要初始化的目录列表（空格分隔），一般用默认值 |
 
@@ -273,13 +274,12 @@ macvlan 这一层，也不用跟 NAS 耦合（NAS 挂了旁路由不受影响）
 
 | 宿主机目录 | 容器路径 | 内容 |
 | --- | --- | --- |
-| `data/config` | `/etc/config` | ★ 核心。网络、防火墙、DHCP、MosDNS、AdGuardHome、OpenClash、Dockerman 等几乎所有 UCI 配置 |
+| `data/config` | `/etc/config` | ★ 核心。网络、防火墙、DHCP、MosDNS、AdGuardHome、OpenClash 等几乎所有 UCI 配置 |
 | `data/openclash` | `/etc/openclash` | OpenClash 配置、订阅、规则集（体积大，不持久化每次都要重新下载） |
 | `data/adguardhome` | `/etc/adguardhome` | AdGuard Home 配置文件 `adguardhome.yaml` |
 | `data/adguardhome-data` | `/var/lib/adguardhome` | AdGuard Home 过滤规则、查询日志、统计数据库（**必须挂**，见下） |
 | `data/mosdns` | `/etc/mosdns` | MosDNS 分流规则与自定义配置 |
 | `data/nftables.d` | `/usr/share/nftables.d` | LuCI 防火墙自定义规则页写的 nftables 片段 |
-| `data/docker` | `/opt/docker` | 容器内 Docker 的数据目录（镜像/容器都在这，会很大） |
 | `data/root` | `/root` | root 家目录（部分插件会往里写状态、SSH key） |
 | `data/log` | `/var/log` | 日志（注意见下方说明） |
 
@@ -394,7 +394,6 @@ docker compose up -d
 | `LAN_GATEWAY` | `192.168.31.1` | 上游网关 |
 | `LAN_DNS1` / `LAN_DNS2` | `223.5.5.5` / `119.29.29.29` | DNS |
 | `ROOT_PASSWORD` | `root` | root 密码 |
-| `DOCKER_DATA_ROOT` | `/opt/docker` | 固件内 Docker 数据目录 |
 | `BRANCH` | `openwrt-25.12` | OpenWrt 分支 |
 | `BUILD_MODE` | `0` | 编译线程模式（CI 里设为 `2`） |
 | `ROOTFS_PARTSIZE` | `2048` | 根分区大小（MiB），决定固件 rootfs 分区容量 |
@@ -439,16 +438,18 @@ CI 里 `BUILD_MODE` 设为 `2`（一半线程）。runner 是 4 vCPU / 16G，mos
 约 2GB。它不进 Docker Hub，只在本地和 CI 缓存里。推送到 Docker Hub 的是体积小得多的
 OpenWrt 系统镜像。
 
-**Q：为什么容器里还装了 Docker / Dockerman？**
-原脚本的插件清单里有 `docker` + `dockerd` + `luci-app-dockerman`，属于「现有功能保留」。
-但容器里再跑 Docker（DinD）需要额外挂 cgroup 并开 privileged，默认不可用，
-这两个插件在容器部署场景下基本是用来看的；刷机到物理机上才正常。
+**Q：为什么镜像里没有 Docker / Dockerman？**
+原脚本的插件清单里有 `docker` + `dockerd` + `luci-app-dockerman`，本 Docker 版已将其移除。
+原因：这台 OpenWrt 本身就跑在 Docker 里，容器里再跑 Docker（DinD）需要额外挂 cgroup
+并开 privileged，默认不可用，而且会给防火墙/网络栈带来一堆干扰。
+如果你需要在 OpenWrt 里跑容器，请改回 `build-openwrt.sh`（宿主机直编版，仍保留这些插件）
+并刷到物理机上。
 
 **Q：容器模式下的网络配置会打架吗？**
 固件默认是 `br-lan` 桥接 `eth0`。容器里 `eth0` 已经是 macvlan 接口，再套一层 bridge
-会不通，所以 `files/etc/uci-defaults/99-default-settings` 里加了判断：
-检测到 `/.dockerenv` 时自动把 LAN 直连 `eth0`，IP 仍然是 `192.168.31.254`。
-刷到物理机上则保持原来的 `br-lan` 配置。
+会不通，所以网络适配放在 `/usr/bin/openwrt-entrypoint.sh` 里：
+它在 `/sbin/init` **之前**跑，检测到 `/.dockerenv` 时把 LAN 直连 `eth0` 并删除
+`br-lan` 设备段，IP 仍然是 `192.168.31.254`。刷到物理机上则保持原来的 `br-lan` 配置。
 
 **Q：重新构建真的很慢怎么办？**
 正常情况只需要复用 Docker Hub 上已有的镜像，不触发编译。

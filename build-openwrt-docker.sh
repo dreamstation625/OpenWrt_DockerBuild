@@ -70,7 +70,7 @@ OpenWrt x86_64 编译脚本（Docker 版）
 
 可用环境变量覆盖：
     OPENWRT_VERSION  LAN_IP  LAN_NETMASK  LAN_GATEWAY  LAN_DNS1  LAN_DNS2
-    ROOT_PASSWORD    DOCKER_DATA_ROOT     BUILD_MODE   DOWNLOAD_JOBS
+    ROOT_PASSWORD                    BUILD_MODE   DOWNLOAD_JOBS
     IMAGE_NAMESPACE  IMAGE_NAME           HOST_WORK_DIR HOST_OUTPUT_DIR
     ROOTFS_PARTSIZE  根分区大小（MiB，默认 2048）
     CCACHE_MAXSIZE   ccache 上限（默认 5G）
@@ -349,7 +349,6 @@ LAN_DNS1="${LAN_DNS1:-223.5.5.5}"
 LAN_DNS2="${LAN_DNS2:-119.29.29.29}"
 
 ROOT_PASSWORD="${ROOT_PASSWORD:-root}"
-DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-/opt/docker}"
 
 # 根文件系统分区大小（MiB）。影响 combined/ext4 镜像里 rootfs 分区的容量。
 # 默认 2048（2G），刷机后在 LuCI 里看到的可用空间由它决定。
@@ -448,7 +447,6 @@ if [ "$IN_CONTAINER" = "0" ] && [ "$USE_DOCKER" = "1" ]; then
         -e "LAN_DNS1=$LAN_DNS1"
         -e "LAN_DNS2=$LAN_DNS2"
         -e "ROOT_PASSWORD=$ROOT_PASSWORD"
-        -e "DOCKER_DATA_ROOT=$DOCKER_DATA_ROOT"
         -e "ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE"
         -e "CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-5G}"
         -w /build
@@ -597,9 +595,6 @@ src-git routing https://github.com/openwrt/routing.git;openwrt-25.12
 # OpenClash
 src-git openclash https://github.com/vernesong/OpenClash.git
 
-# Docker 管理界面
-src-git dockerman https://github.com/lisaac/luci-app-dockerman.git
-
 # 磁盘管理
 src-git diskman https://github.com/lisaac/luci-app-diskman.git
 
@@ -692,6 +687,17 @@ fi
 
 if [ -d feeds/luci/applications/luci-app-adguardhome ] && [ ! -e package/feeds/luci/luci-app-adguardhome ]; then
     ./scripts/feeds install luci-app-adguardhome 2>&1 | tail -5 || true
+fi
+
+# Docker 管理界面（dockerman）已从 feeds.conf 移除。
+# 注意：改 feeds.conf 后 scripts/feeds update/install **不会**自动清理旧 feed，
+# 旧的 package/feeds/dockerman 符号链接会继续存在于 work/ 里并参与后续编译。
+# 所以这里显式清残留，保证增量构建时不会再编出 Docker 相关插件。
+if [ -d feeds/dockerman ] || [ -e package/feeds/dockerman ]; then
+    echo "发现已移除的 dockerman feed 残留，正在清理..."
+    rm -rf feeds/dockerman
+    rm -rf package/feeds/dockerman
+    rm -rf tmp/info/.packageinfo-feeds_dockerman*
 fi
 echo "✓ feeds 更新完成"
 
@@ -800,7 +806,6 @@ CONFIG_PACKAGE_luci-app-ttyd=y
 ###############################################################################
 
 CONFIG_PACKAGE_luci-app-openclash=y
-CONFIG_PACKAGE_luci-app-dockerman=y
 CONFIG_PACKAGE_luci-app-diskman=y
 CONFIG_PACKAGE_luci-app-advancedplus=y
 CONFIG_PACKAGE_luci-app-syscontrol=y
@@ -825,13 +830,6 @@ CONFIG_PACKAGE_adguardhome=y
 CONFIG_PACKAGE_mosdns=y
 CONFIG_PACKAGE_v2ray-geoip=y
 CONFIG_PACKAGE_v2ray-geosite=y
-
-###############################################################################
-# Docker
-###############################################################################
-
-CONFIG_PACKAGE_docker=y
-CONFIG_PACKAGE_dockerd=y
 
 ###############################################################################
 # 网络 / 协议
@@ -936,7 +934,6 @@ CONFIG_PACKAGE_luci-i18n-firewall4-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-system-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-nginx-zh-cn=y
-CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-diskman-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-filemanager-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
@@ -989,7 +986,6 @@ sed -i '/^CONFIG_PACKAGE_luci-i18n-opkg-zh-cn=/d' .config
 sed -i '/^CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn=/d' .config
 sed -i '/^CONFIG_PACKAGE_luci-i18n-system-zh-cn=/d' .config
 sed -i '/^CONFIG_PACKAGE_luci-i18n-nginx-zh-cn=/d' .config
-sed -i '/^CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=/d' .config
 sed -i '/^CONFIG_PACKAGE_luci-i18n-filemanager-zh-cn=/d' .config
 sed -i '/^CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=/d' .config
 sed -i '/^CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=/d' .config
@@ -1033,7 +1029,6 @@ CONFIG_PACKAGE_luci-i18n-firewall4-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-system-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-nginx-zh-cn=y
-CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-diskman-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-filemanager-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
@@ -1159,32 +1154,11 @@ if [ -f /etc/config/uhttpd ]; then
         uci commit uhttpd
 fi
 
-mkdir -p '${DOCKER_DATA_ROOT}'
-if [ -f /etc/config/dockerd ]; then
-        uci set dockerd.globals.data_root='${DOCKER_DATA_ROOT}'
-        uci commit dockerd
-fi
-
-if [ -f /etc/config/dockerman ]; then
-        uci set dockerman.local.daemon_data_root='${DOCKER_DATA_ROOT}'
-        uci commit dockerman
-fi
-
-touch /etc/sysupgrade.conf
-for backup_path in \
-        /etc/config/dockerd \
-        /etc/config/dockerman \
-        '${DOCKER_DATA_ROOT}'
-do
-        grep -qxF "\${backup_path}" /etc/sysupgrade.conf || echo "\${backup_path}" >> /etc/sysupgrade.conf
-done
-
 # 25.12 uses apk repositories. Third-party feeds built into this firmware do not
 # have package repositories on downloads.openwrt.org, so keep only real feeds.
 if [ -f /etc/apk/repositories.d/distfeeds.list ]; then
         sed -i \
                 -e '/\/openclash\/packages\.adb$/d' \
-                -e '/\/dockerman\/packages\.adb$/d' \
                 -e '/\/diskman\/packages\.adb$/d' \
                 -e '/\/advancedplus\/packages\.adb$/d' \
                 -e '/\/syscontrol\/packages\.adb$/d' \
@@ -1196,7 +1170,6 @@ rm -rf /tmp/luci-*
 
 /etc/init.d/nginx enable >/dev/null 2>&1 || true
 /etc/init.d/uhttpd enable >/dev/null 2>&1 || true
-/etc/init.d/dockerd enable >/dev/null 2>&1 || true
 # AdGuard Home：官方 adguardhome 包的 init 脚本是小写 adguardhome。
 # 大写那行是给老版本第三方包兜底的，不存在也不会报错。
 /etc/init.d/AdGuardHome enable >/dev/null 2>&1 || true
