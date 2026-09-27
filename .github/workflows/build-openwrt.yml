@@ -11,9 +11,9 @@
 #   5. 打包成 OpenWrt 系统镜像并推送到 Docker Hub
 #   6. 刷机固件上传 Artifact / GitHub Release
 #
-# 依赖的环境配置（仓库 Settings → Environments，环境名需与下方 environment 一致）：
-#   Variables: DOCKERHUB_USERNAME
-#   Secrets:   DOCKERHUB_TOKEN
+# 依赖的环境配置（仓库 Settings → Environments → DOCKERHUB）：
+#   Variables: DOCKERHUB_USERNAME   （Docker Hub 用户名/命名空间，明文变量）
+#   Secrets:   DOCKERHUB_TOKEN      （Docker Hub Access Token，加密密钥）
 ###############################################################################
 name: Build OpenWrt x86_64
 
@@ -48,9 +48,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # ⚠ 这里必须和「仓库 Settings → Environments」里配置的环境名一致，
+    # ⚠ 必须和「仓库 Settings → Environments」里配置的环境名完全一致，
     #   否则 vars.DOCKERHUB_USERNAME / secrets.DOCKERHUB_TOKEN 取不到值
-    environment: dockerhub
+    environment: DOCKERHUB
     timeout-minutes: 350
 
     steps:
@@ -64,10 +64,21 @@ jobs:
         id: gate
         env:
           DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           INPUT_VERSION: ${{ inputs.version }}
           FORCE_REBUILD: ${{ inputs.force_rebuild }}
         run: |
           set -euo pipefail
+
+          # 取值失败时给出明确报错，否则后面会出现 "/openwrt:1.0.0" 这种诡异镜像名
+          [ -n "${DOCKERHUB_USERNAME:-}" ] || {
+            echo "::error::vars.DOCKERHUB_USERNAME 为空 → Settings → Environments → DOCKERHUB → Environment variables 中添加 DOCKERHUB_USERNAME"
+            exit 1
+          }
+          [ -n "${DOCKERHUB_TOKEN:-}" ] || {
+            echo "::error::secrets.DOCKERHUB_TOKEN 为空 → Settings → Environments → DOCKERHUB → Environment secrets 中添加 DOCKERHUB_TOKEN"
+            exit 1
+          }
 
           if [ -n "${INPUT_VERSION:-}" ]; then
             VERSION="$INPUT_VERSION"

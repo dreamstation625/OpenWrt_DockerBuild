@@ -140,13 +140,19 @@ docker compose up -d
 
 ## 仓库需要配置的环境变量
 
-仓库 `Settings → Environments` 里建一个名为 **`dockerhub`** 的环境
-（如果你的环境叫别的名字，改 `.github/workflows/build-openwrt.yml` 里的 `environment`）：
+仓库 `Settings → Environments` 里建一个名为 **`DOCKERHUB`** 的环境
+（工作流里写死的 `environment: DOCKERHUB`，改环境名就要同步改 `.github/workflows/build-openwrt.yml`）：
 
 | 类型 | 名称 | 值 |
 | --- | --- | --- |
 | Variable | `DOCKERHUB_USERNAME` | `dreamstation625` |
 | Secret | `DOCKERHUB_TOKEN` | Docker Hub Access Token（需 Read & Write 权限） |
+
+> Token 在 Docker Hub `Account Settings → Personal Access Tokens` 生成，
+> 权限勾 **Read & Write**（只读没法 push）。用户名是明文变量即可，不算敏感信息。
+>
+> 两个值缺任意一个，workflow 会在第一步「解析版本号并检查 Docker Hub」直接报错退出，
+> 不会等到登录步骤才失败。
 
 ---
 
