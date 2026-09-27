@@ -170,9 +170,39 @@ docker compose up -d
 | `ROOT_PASSWORD` | `root` | root 密码 |
 | `DOCKER_DATA_ROOT` | `/opt/docker` | 固件内 Docker 数据目录 |
 | `BRANCH` | `openwrt-25.12` | OpenWrt 分支 |
-| `BUILD_MODE` | `0` | 编译线程模式 |
+| `BUILD_MODE` | `0` | 编译线程模式（CI 里设为 `2`） |
+| `ROOTFS_PARTSIZE` | `2048` | 根分区大小（MiB），决定固件 rootfs 分区容量 |
 | `IMAGE_NAMESPACE` / `IMAGE_NAME` | `dreamstation625` / `openwrt` | 镜像仓库 |
 | `CCACHE_MAXSIZE` | `5G` | ccache 上限 |
+| `LOG_TAIL_LINES` | CI `400` / 本地 `120` | 编译失败时回填的日志行数 |
+
+改根分区大小不用动脚本：
+
+```bash
+ROOTFS_PARTSIZE=4096 ./build-openwrt-docker.sh
+```
+
+---
+
+## GitHub Actions 适配说明
+
+脚本检测到 `CI=true` 或 `GITHUB_ACTIONS=true` 会自动进入 CI 模式，行为和本地不同：
+
+| 项 | 本地 | CI |
+| --- | --- | --- |
+| make 输出 | 实时 `tee` 到屏幕 | 写入 `work/openwrt/build-logs/*.log`，前台只打分钟级进度 |
+| Actions 日志 | — | 各阶段用 `::group::` 折叠，失败时输出 `::error::` 注解 |
+| 失败排查 | 屏幕直接看 | 日志尾部回填（400 行）+ 编译日志作为 Artifact 上传 |
+| 产物摘要 | — | 生成 `output/build-summary.md`，workflow 追加到 Summary 页 |
+
+这么做的原因：OpenWrt `V=s` 全量编译有几十万行输出，直接打到 Actions 日志会被限流
+甚至截断，真正报错反而被冲掉。
+
+**关键点**：真正跑 `make` 的是容器，所以 `CI` 标识会通过 `docker run -e` 透传进容器，
+否则容器里不会走静默逻辑。
+
+CI 里 `BUILD_MODE` 设为 `2`（一半线程）。runner 是 4 vCPU / 16G，mosdns、adguardhome
+这类 Go 包并行跑满 4 线程有 OOM 风险。
 
 ---
 

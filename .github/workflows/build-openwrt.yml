@@ -38,8 +38,12 @@ permissions:
 
 env:
   IMAGE_NAME: openwrt
-  BUILD_MODE: '0'
+  # runner 是 4 vCPU / 16G，用模式 2（一半线程）更稳：
+  # mosdns / adguardhome 这些 Go 包并行吃内存，跑满 4 线程有 OOM 风险。
+  BUILD_MODE: '2'
   CCACHE_MAXSIZE: 3G
+  # 编译失败时回填到 Actions 日志的尾部行数
+  LOG_TAIL_LINES: '400'
 
 concurrency:
   group: openwrt-build-${{ github.ref }}
@@ -206,6 +210,24 @@ jobs:
             output/sha256sums
           if-no-files-found: warn
           retention-days: 30
+
+      # 脚本在 CI 模式下把 make 的完整输出写进了日志文件，
+      # 编译失败时把它传上来，否则 Actions 日志里看不到真正的报错。
+      - name: 上传编译日志（失败时）
+        if: failure() && steps.gate.outputs.rebuild == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-build-logs-${{ steps.gate.outputs.version }}
+          path: output/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 追加编译摘要
+        if: steps.gate.outputs.rebuild == 'true'
+        run: |
+          if [ -f output/build-summary.md ]; then
+            cat output/build-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: 发布 GitHub Release
         if: steps.gate.outputs.rebuild == 'true' && startsWith(github.ref, 'refs/tags/v')

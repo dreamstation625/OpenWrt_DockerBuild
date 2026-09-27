@@ -30,6 +30,14 @@ export FORCE_UNSAFE_CONFIGURE=1
 #   --push           打包后推送到 Docker Hub（隐含 --package-image）
 #   --install-deps   容器内也重新安装一次依赖（一般不需要）
 #
+# GitHub Actions 适配：
+#   检测到 CI=true / GITHUB_ACTIONS=true 自动进入 CI 模式：
+#     - make 的完整输出写入 work/openwrt/build-logs/*.log，前台只打进度，
+#       避免几十万行输出把 Actions 日志撑爆；
+#     - Actions 日志折叠分组（::group::），失败时输出 ::error:: 注解；
+#     - 产物目录生成 build-summary.md 并拷贝编译日志，失败也能下载排查。
+#   CI 标识会透传进容器，真正跑 make 的是容器，这点必须传。
+#
 # 容器内手动执行：
 #   docker run --rm -v "$PWD/work:/build" -v "$PWD/output:/output" \
 #       -v "$PWD:/src:ro" openwrt-build-env:local \
@@ -64,6 +72,15 @@ OpenWrt x86_64 编译脚本（Docker 版）
     OPENWRT_VERSION  LAN_IP  LAN_NETMASK  LAN_GATEWAY  LAN_DNS1  LAN_DNS2
     ROOT_PASSWORD    DOCKER_DATA_ROOT     BUILD_MODE   DOWNLOAD_JOBS
     IMAGE_NAMESPACE  IMAGE_NAME           HOST_WORK_DIR HOST_OUTPUT_DIR
+    ROOTFS_PARTSIZE  根分区大小（MiB，默认 2048）
+    CCACHE_MAXSIZE   ccache 上限（默认 5G）
+    LOG_TAIL_LINES   失败时回填的日志行数（CI 默认 400，本地 120）
+
+GitHub Actions：
+    检测到 CI=true / GITHUB_ACTIONS=true 时自动启用 CI 模式：
+    日志写入文件不刷屏、Actions 日志折叠分组、失败时输出 ::error:: 注解，
+    并在产物目录生成 build-summary.md 与编译日志。
+    该标识会通过 docker run -e 透传进容器，容器内的 make 同样生效。
 
 容器内手动执行：
     docker run --rm -v "$PWD/work:/build" -v "$PWD/output:/output" \
@@ -109,6 +126,76 @@ log()  { printf '%s\n' "$*"; }
 warn() { printf '⚠ %s\n' "$*" >&2; }
 die()  { printf '✗ %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+###############################################################################
+# GitHub Actions / CI 适配
+###############################################################################
+# CI 环境下有三个和本地不同的地方，必须特殊处理：
+#   1) 日志量：OpenWrt 全量编译 V=s 有几十万行，直接打到 Actions 日志会被限流
+#      甚至截断，失败时反而找不到关键报错。CI 下改为写入日志文件，前台只打
+#      心跳，失败时再 tail 尾部（见 run_logged）。
+#   2) 折叠分组：用 ::group:: / ::endgroup:: 让 Actions 日志可折叠。
+#   3) 注解：失败时输出 ::error::，在 Actions 页面直接可见。
+###############################################################################
+
+ci_group_start() { [ "$IN_CI" = "1" ] && printf '::group::%s\n' "$*"; return 0; }
+ci_group_end()   { [ "$IN_CI" = "1" ] && printf '::endgroup::\n';        return 0; }
+ci_error()       { [ "$IN_CI" = "1" ] && printf '::error::%s\n' "$*";    return 0; }
+ci_notice()      { [ "$IN_CI" = "1" ] && printf '::notice::%s\n' "$*";   return 0; }
+
+# 失败时用多大的日志尾部（行）。CI 下默认给足，本地保持精简。
+LOG_TAIL_LINES="${LOG_TAIL_LINES:-}"
+
+# 在 CI 里执行耗时命令：完整输出进日志文件，前台只打印分钟级进度。
+# 用法：run_logged <日志文件> <命令> [参数...]
+run_logged() {
+    local logfile="$1"; shift
+    local rc=0 start elapsed
+
+    # 本地：保持原来的实时 tee 行为，方便直接看编译过程
+    if [ "$IN_CI" != "1" ]; then
+        "$@" 2>&1 | tee "$logfile"
+        return $?
+    fi
+
+    log "完整输出已写入: $logfile"
+    log "（CI 模式：前台只打印进度，失败时会回填日志尾部）"
+
+    # 记住调用方原本有没有开 errexit，退出前原样恢复。
+    # 直接写 set -e 会在调用方本已关闭时把它强行打开。
+    local errexit_on=0
+    case "$-" in *e*) errexit_on=1 ;; esac
+
+    start=$(date +%s)
+    set +e
+    "$@" >"$logfile" 2>&1 &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 60
+        if kill -0 "$pid" 2>/dev/null; then
+            elapsed=$(( $(date +%s) - start ))
+            log "[进行中] ${*} → 已跑 $((elapsed / 60)) 分 $((elapsed % 60)) 秒"
+        fi
+    done
+    wait "$pid"
+    rc=$?
+    [ "$errexit_on" = "1" ] && set -e
+
+    elapsed=$(( $(date +%s) - start ))
+    log "[结束] 用时 $((elapsed / 60)) 分 $((elapsed % 60)) 秒，退出码 $rc"
+    return $rc
+}
+
+# 失败时打印日志尾部；本地 120 行够看，CI 下给 400 行便于定位
+fail_tail() {
+    local logfile="$1"
+    local lines="${LOG_TAIL_LINES:-}"
+    [ -n "$lines" ] || { [ "$IN_CI" = "1" ] && lines=400 || lines=120; }
+    [ -f "$logfile" ] || return 0
+    echo "===== $logfile 最后 $lines 行 ====="
+    tail -n "$lines" "$logfile" || true
+    echo "=================================="
+}
 
 # 计算文件摘要，用于给编译环境镜像打 tag（Dockerfile 变了才重建）
 file_digest() {
@@ -167,6 +254,8 @@ package_system_image() {
 
     local repo="${IMAGE_REPO}:${OPENWRT_VERSION}"
     log "正在打包 OpenWrt 系统镜像: $repo"
+
+    ci_group_start "打包 OpenWrt 系统镜像 $repo"
     docker build \
         -f "$ctx/Dockerfile" \
         --build-arg "OPENWRT_VERSION=$OPENWRT_VERSION" \
@@ -174,16 +263,23 @@ package_system_image() {
         -t "$repo" \
         -t "${IMAGE_REPO}:latest" \
         "$ctx"
+    ci_group_end
 
     log "✓ 镜像打包完成: $repo (同时打了 ${IMAGE_REPO}:latest)"
 
     if [ "$PUSH_IMAGE" = "1" ]; then
-        if [ -z "${DOCKERHUB_USERNAME:-}" ] && [ -z "${DOCKERHUB_TOKEN:-}" ]; then
-            warn "未提供 Docker Hub 凭据（DOCKERHUB_USERNAME / DOCKERHUB_TOKEN），请先 docker login"
+        # 给了凭据就自己登录（本地用法）；没给就假定已登录
+        # （CI 里由 docker/login-action 完成，避免重复登录）。
+        if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+            printf '%s' "$DOCKERHUB_TOKEN" | \
+                docker login -u "$DOCKERHUB_USERNAME" --password-stdin
         fi
+        ci_group_start "推送镜像到 Docker Hub"
         docker push "$repo"
         docker push "${IMAGE_REPO}:latest"
-        log "✓ 已推送到 Docker Hub"
+        ci_group_end
+        log "✓ 已推送到 Docker Hub: $repo"
+        ci_notice "已推送 ${repo} 与 ${IMAGE_REPO}:latest"
     fi
 }
 
@@ -207,6 +303,12 @@ package_system_image() {
 ###############################################################################
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# CI 环境检测。容器内也要能识别，所以这个值会通过 docker run -e 传进去。
+IN_CI=0
+if [ "${CI:-}" = "true" ] || [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    IN_CI=1
+fi
 
 # 版本号：环境变量优先，其次读取仓库根目录的 VERSION 文件
 if [ -z "${OPENWRT_VERSION:-}" ] && [ -f "$PROJECT_DIR/VERSION" ]; then
@@ -244,6 +346,10 @@ LAN_DNS2="${LAN_DNS2:-119.29.29.29}"
 
 ROOT_PASSWORD="${ROOT_PASSWORD:-root}"
 DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-/opt/docker}"
+
+# 根文件系统分区大小（MiB）。影响 combined/ext4 镜像里 rootfs 分区的容量。
+# 默认 2048（2G），刷机后在 LuCI 里看到的可用空间由它决定。
+ROOTFS_PARTSIZE="${ROOTFS_PARTSIZE:-2048}"
 
 # 编译优化配置
 # 用法：
@@ -339,9 +445,24 @@ if [ "$IN_CONTAINER" = "0" ] && [ "$USE_DOCKER" = "1" ]; then
         -e "LAN_DNS2=$LAN_DNS2"
         -e "ROOT_PASSWORD=$ROOT_PASSWORD"
         -e "DOCKER_DATA_ROOT=$DOCKER_DATA_ROOT"
+        -e "ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE"
         -e "CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-5G}"
         -w /build
     )
+
+    # CI 标识必须透传进容器：真正的 make 是在容器里跑的，
+    # 容器不知道自己在 CI 就不会走日志静默与分组逻辑。
+    if [ "$IN_CI" = "1" ]; then
+        DOCKER_RUN_ARGS+=(
+            -e "CI=true"
+            -e "GITHUB_ACTIONS=${GITHUB_ACTIONS:-true}"
+            -e "GITHUB_RUN_ID=${GITHUB_RUN_ID:-}"
+            -e "GITHUB_SHA=${GITHUB_SHA:-}"
+        )
+        if [ -n "${LOG_TAIL_LINES:-}" ]; then
+            DOCKER_RUN_ARGS+=( -e "LOG_TAIL_LINES=$LOG_TAIL_LINES" )
+        fi
+    fi
 
     # Linux 下用当前用户身份编译，避免 ./work 里出现 root 属主文件
     if [ "$(uname -s)" = "Linux" ]; then
@@ -361,8 +482,10 @@ if [ "$IN_CONTAINER" = "0" ] && [ "$USE_DOCKER" = "1" ]; then
     echo "下载线程  : $DOWNLOAD_JOBS"
     echo "=========================================="
 
+    ci_group_start "OpenWrt 编译（容器内 $ENV_IMAGE）"
     docker run "${DOCKER_RUN_ARGS[@]}" "$ENV_IMAGE" \
         bash /src/build-openwrt-docker.sh --in-container
+    ci_group_end
 
     echo
     echo "✓ 容器内编译完成，产物目录: $HOST_OUTPUT_DIR"
@@ -488,11 +611,13 @@ src-git syscontrol https://github.com/bobbyunknown/luci-app-syscontrol.git
 src-git mosdns https://github.com/sbwml/luci-app-mosdns.git
 EOF
 
+ci_group_start "更新并安装 feeds"
 echo "正在更新 feeds..."
 # 优化：不清理所有 feeds，只更新必要的
 ./scripts/feeds update -a 2>&1 | tail -20
 echo "正在安装 feeds 包..."
 ./scripts/feeds install -a 2>&1 | tail -20
+ci_group_end
 
 FIREWALL_MENU="package/feeds/luci/luci-app-firewall/root/usr/share/luci/menu.d/luci-app-firewall.json"
 if [ -f "$FIREWALL_MENU" ]; then
@@ -590,7 +715,7 @@ CONFIG_TARGET_ROOTFS_TARGZ=y
 # CONFIG_TARGET_IMAGES_PAD is not set
 CONFIG_GRUB_IMAGES=y
 CONFIG_EFI_IMAGES=y
-CONFIG_TARGET_ROOTFS_PARTSIZE=4096
+CONFIG_TARGET_ROOTFS_PARTSIZE=2048
 
 ###############################################################################
 # 软件包管理：OpenWrt 25.12 使用 apk
@@ -856,7 +981,7 @@ CONFIG_TARGET_ROOTFS_SQUASHFS=y
 CONFIG_TARGET_ROOTFS_TARGZ=y
 # CONFIG_TARGET_ROOTFS_EXT4FS is not set
 # CONFIG_TARGET_IMAGES_PAD is not set
-CONFIG_TARGET_ROOTFS_PARTSIZE=4096
+CONFIG_TARGET_ROOTFS_PARTSIZE=2048
 
 ###############################################################################
 # apk + 常用管理插件
@@ -894,6 +1019,11 @@ CONFIG_PACKAGE_luci-i18n-mosdns-zh-cn=y
 CONFIG_LUCI_LANG_zh-cn=y
 CONFIG_LUCI_LANG_zh_Hans=y
 EOF
+
+# 根分区大小统一覆盖：heredoc 里写的是默认值 2048，
+# 这里再按 ROOTFS_PARTSIZE 环境变量刷一遍，改分区不用动脚本。
+sed -i "s/^CONFIG_TARGET_ROOTFS_PARTSIZE=.*/CONFIG_TARGET_ROOTFS_PARTSIZE=${ROOTFS_PARTSIZE}/" .config
+echo "✓ 根分区大小: ${ROOTFS_PARTSIZE} MiB"
 
 echo "正在生成最终配置..."
 make defconfig
@@ -1144,21 +1274,35 @@ echo "OpenWrt 25.12 uses apk; skipping legacy opkg source hash workaround."
 # 下载源码包（优化：并行下载，失败时重试）
 ###############################################################################
 
+# 编译日志目录：下载 / 并行编译 / 单线程编译各一份，CI 下靠它定位失败原因
+BUILD_LOG_DIR="$WORKDIR/openwrt/build-logs"
+BUILD_LOG_STAMP=$(date '+%Y%m%d-%H%M%S')
+DOWNLOAD_LOG="$BUILD_LOG_DIR/download-${BUILD_LOG_STAMP}.log"
+PARALLEL_LOG="$BUILD_LOG_DIR/build-parallel-${BUILD_LOG_STAMP}.log"
+SINGLE_LOG="$BUILD_LOG_DIR/build-single-${BUILD_LOG_STAMP}.log"
+mkdir -p "$BUILD_LOG_DIR"
+
 echo
 echo "================ 开始下载源码包 ================"
 echo "使用 $DOWNLOAD_JOBS 个并行线程下载..."
+echo "下载日志: $DOWNLOAD_LOG"
 echo
 
+ci_group_start "下载源码包"
 # 首次尝试并行下载
-if make download -j"$DOWNLOAD_JOBS" V=s; then
+if run_logged "$DOWNLOAD_LOG" make download -j"$DOWNLOAD_JOBS" V=s; then
     echo "✓ 所有源码包下载完成"
 else
     echo "⚠ 部分下载失败，尝试单线程重试..."
-    make download -j1 V=s || {
-        echo "✗ 下载失败，请检查网络连接"
-        exit 1
-    }
+    if run_logged "$DOWNLOAD_LOG" make download -j1 V=s; then
+        echo "✓ 单线程重试下载完成"
+    else
+        ci_error "源码包下载失败，详见 $DOWNLOAD_LOG"
+        fail_tail "$DOWNLOAD_LOG"
+        die "下载失败，请检查网络连接"
+    fi
 fi
+ci_group_end
 
 ###############################################################################
 # 编译（优化：启用详细输出和错误处理）
@@ -1175,17 +1319,15 @@ echo
 # 首次尝试并行编译
 START_TIME=$(date +%s)
 START_TIME_TEXT=$(date '+%Y-%m-%d %H:%M:%S')
-BUILD_LOG_DIR="$WORKDIR/openwrt/build-logs"
-BUILD_LOG_STAMP=$(date '+%Y%m%d-%H%M%S')
-PARALLEL_LOG="$BUILD_LOG_DIR/build-parallel-${BUILD_LOG_STAMP}.log"
-SINGLE_LOG="$BUILD_LOG_DIR/build-single-${BUILD_LOG_STAMP}.log"
 mkdir -p "$BUILD_LOG_DIR"
 echo "编译开始时间: $START_TIME_TEXT"
 echo "并行编译日志: $PARALLEL_LOG"
 echo "单线程编译日志: $SINGLE_LOG"
 echo
 
-if make -j"${BUILD_THREADS}" V=s 2>&1 | tee "$PARALLEL_LOG"; then
+ci_group_start "并行编译 -j${BUILD_THREADS}"
+if run_logged "$PARALLEL_LOG" make -j"${BUILD_THREADS}" V=s; then
+    ci_group_end
     END_TIME=$(date +%s)
     END_TIME_TEXT=$(date '+%Y-%m-%d %H:%M:%S')
     ELAPSED=$((END_TIME - START_TIME))
@@ -1196,13 +1338,14 @@ if make -j"${BUILD_THREADS}" V=s 2>&1 | tee "$PARALLEL_LOG"; then
     echo "编译用时: $((ELAPSED / 3600)) 小时 $(((ELAPSED % 3600) / 60)) 分 $((ELAPSED % 60)) 秒"
     echo "编译日志: $PARALLEL_LOG"
 else
+    ci_group_end
     echo "⚠ 并行编译失败，尝试单线程编译以获取详细错误..."
     echo
-    echo "================ 并行编译日志最后 120 行 ================"
-    tail -n 120 "$PARALLEL_LOG" || true
-    echo "========================================================="
+    fail_tail "$PARALLEL_LOG"
     echo
-    if make -j1 V=s 2>&1 | tee "$SINGLE_LOG"; then
+    ci_group_start "单线程编译（定位错误）"
+    if run_logged "$SINGLE_LOG" make -j1 V=s; then
+        ci_group_end
         END_TIME=$(date +%s)
         END_TIME_TEXT=$(date '+%Y-%m-%d %H:%M:%S')
         ELAPSED=$((END_TIME - START_TIME))
@@ -1214,14 +1357,14 @@ else
         echo "并行编译日志: $PARALLEL_LOG"
         echo "单线程编译日志: $SINGLE_LOG"
     else
+        ci_group_end
         END_TIME=$(date +%s)
         END_TIME_TEXT=$(date '+%Y-%m-%d %H:%M:%S')
         ELAPSED=$((END_TIME - START_TIME))
         echo
-        echo "================ 单线程编译日志最后 200 行 ================"
-        tail -n 200 "$SINGLE_LOG" || true
-        echo "==========================================================="
+        fail_tail "$SINGLE_LOG"
         echo
+        ci_error "OpenWrt 编译失败（并行日志 $PARALLEL_LOG / 单线程日志 $SINGLE_LOG）"
         echo "✗ 编译失败"
         echo "编译开始时间: $START_TIME_TEXT"
         echo "编译结束时间: $END_TIME_TEXT"
@@ -1264,3 +1407,39 @@ else
     collect_artifacts "$OUTDIR" "$HOST_OUTPUT_DIR" || warn "产物收集失败，请手动从 $OUTDIR 取固件"
 fi
 echo
+
+###############################################################################
+# CI：写一份 Markdown 摘要到产物目录
+# 容器里没有 $GITHUB_STEP_SUMMARY 那个路径，所以落到 /output，
+# 由 workflow 再 cat 进 Actions 的 Summary 页面。
+###############################################################################
+if [ "$IN_CI" = "1" ]; then
+    if [ "$IN_CONTAINER" = "1" ]; then
+        SUMMARY_DIR="/output"
+    else
+        SUMMARY_DIR="$HOST_OUTPUT_DIR"
+    fi
+    mkdir -p "$SUMMARY_DIR"
+    {
+        echo "### OpenWrt 编译产物"
+        echo ""
+        echo "| 项 | 值 |"
+        echo "| --- | --- |"
+        echo "| 构建版本 | \`${OPENWRT_VERSION}\` |"
+        echo "| 目标平台 | x86/64（generic） |"
+        echo "| 根分区大小 | ${ROOTFS_PARTSIZE} MiB |"
+        echo "| 编译线程 | ${BUILD_THREADS}（模式 ${BUILD_MODE}：${BUILD_MODE_DESC}） |"
+        echo "| 编译用时 | $((ELAPSED / 3600)) 小时 $(((ELAPSED % 3600) / 60)) 分 $((ELAPSED % 60)) 秒 |"
+        echo "| 固件目录 | \`${OUTDIR}\` |"
+        echo ""
+        echo "编译日志：\`${PARALLEL_LOG}\`"
+    } > "$SUMMARY_DIR/build-summary.md"
+    log "✓ CI 摘要已写入: $SUMMARY_DIR/build-summary.md"
+fi
+
+# 产物目录里的日志文件也拷一份，方便 CI 失败后直接下载查看
+if [ "$IN_CI" = "1" ] && [ -d "$BUILD_LOG_DIR" ]; then
+    if [ "$IN_CONTAINER" = "1" ]; then
+        cp -f "$BUILD_LOG_DIR"/*.log /output/ 2>/dev/null || true
+    fi
+fi
