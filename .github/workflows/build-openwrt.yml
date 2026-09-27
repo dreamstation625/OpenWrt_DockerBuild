@@ -196,6 +196,10 @@ jobs:
         env:
           OPENWRT_VERSION: ${{ steps.gate.outputs.version }}
           IMAGE_NAMESPACE: ${{ vars.DOCKERHUB_USERNAME }}
+          # Dockerfile.image 用了 COPY --chmod（保证 entrypoint 可执行位），
+          # 这是 BuildKit 专属语法，经典 builder 会报
+          # "the --chmod option requires BuildKit"。显式打开更稳。
+          DOCKER_BUILDKIT: "1"
         run: |
           ./build-openwrt-docker.sh --package-only --push
 
