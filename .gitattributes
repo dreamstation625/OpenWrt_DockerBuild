@@ -1,0 +1,13 @@
+# 规范化行尾，避免 Windows 编辑时把 LF 改回 CRLF
+* text=auto eol=lf
+
+# 脚本必须是 LF，否则 Linux/Docker 中 shebang 会变成 "/usr/bin/env bash\r"
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# OpenWrt 源码生成物
+*.bin  binary
+*.img  binary
+*.gz   binary
+*.xz   binary
+*.zst  binary
