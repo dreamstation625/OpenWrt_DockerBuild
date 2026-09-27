@@ -59,6 +59,13 @@ networks:
       config:
         - subnet: ${LAN_SUBNET:-192.168.31.0/24}
           gateway: ${LAN_GATEWAY:-192.168.31.1}
+    #
+    # 群晖 Container Manager 图形界面不一定能建 macvlan 网络。
+    # 如果已经用命令行手工建好了（docker network create -d macvlan ...），
+    # 就改成引用外部网络，别让 compose 再建一次：
+    #
+    #   external: true
+    #   name: openwrt-lan
 
 # volumes:
 #   openwrt-config:

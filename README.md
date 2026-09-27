@@ -124,6 +124,96 @@ docker compose up -d
 
 ---
 
+## 在 PVE 虚拟机里的 NAS 上部署（群晖 / 飞牛）
+
+### 结论
+
+**VM + VirtIO 网卡 → macvlan 可用。**
+
+macvlan 的内核支持由**跑 Docker 的那台机器（NAS 自己）**提供，PVE 不需要为 macvlan
+做任何配置 —— 对它来说，容器发出的只是源 MAC 不同的普通以太网帧。
+
+PVE 侧只要别把这些帧当成 MAC 欺骗丢掉就行。
+
+### PVE 检查清单
+
+| 项 | 要求 | 不这么做会怎样 |
+| --- | --- | --- |
+| 网卡型号 | **VirtIO**（半虚拟化） | 用 SR-IOV 直通的 VF 上**建不了 macvlan**，直接报错 |
+| VM 网卡防火墙 | **取消勾选** | PVE 防火墙的 MAC filter 拦截虚拟 MAC，表现为"容器起来了但 ping 不通网关" |
+| 桥类型 | 默认 Linux bridge（`vmbr0`） | 用 OVS 时要另外确认未知 MAC 能泛洪 |
+
+关防火墙：PVE → 选中 NAS 虚拟机 → Hardware → 网卡 → 去掉 **Firewall** 勾选。
+
+### 群晖 DSM
+
+**网卡名是第一个坑。** 群晖如果开了 Open vSwitch（多网卡聚合时常开），网卡名是
+`ovs_eth0` 而不是 `eth0`。SSH 进群晖确认：
+
+```bash
+ip -br link
+```
+
+DSM 7 的 Container Manager（原 Docker 套件）图形界面不一定给 macvlan 的创建入口，
+建议命令行建：
+
+```bash
+docker network create -d macvlan \
+  --subnet=192.168.31.0/24 \
+  --gateway=192.168.31.1 \
+  -o parent=eth0 \
+  openwrt-lan
+```
+
+然后把 `docker-compose.yml` 里 `networks.lan` 改成引用这个外部网络
+（文件里已写好注释掉的 `external: true`）。或者不用 compose，直接跑：
+
+```bash
+docker run -d --name openwrt --restart unless-stopped \
+  --network openwrt-lan --ip 192.168.31.254 \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
+  --sysctl net.ipv4.ip_forward=1 \
+  dreamstation625/openwrt:1.0.0
+```
+
+**群晖自己访问不了 `192.168.31.254`**（macvlan 固有行为），要加子接口：
+
+```bash
+ip link add mac0 link eth0 type macvlan mode bridge
+ip addr add 192.168.31.253/24 dev mac0
+ip link set mac0 up
+```
+
+群晖重启会丢，用「控制面板 → 任务计划 → 新增 → 触发的任务 → 开机」写进去。
+
+### 飞牛 OS（FnOS）
+
+基于 Debian，是原生 Docker，`ip -br link` 看网卡名（一般是 `eth0` 或 `ens18`），
+填进 `.env` 后直接 `docker compose up -d` 就行，没有群晖那些坑。
+
+### 先验证链路再部署
+
+在 NAS 上跑一遍，通了再起容器：
+
+```bash
+lsmod | grep macvlan || modprobe macvlan
+ip link add mv-test link eth0 type macvlan mode bridge
+ip link set mv-test up
+ip addr add 192.168.31.99/24 dev mv-test
+ping -c 3 192.168.31.1      # 通 → 链路 OK
+ip link del mv-test
+```
+
+不通就按上面的 PVE 检查清单逐项排查，90% 是 VM 网卡的 Firewall 没关。
+
+### 备选：既然有 PVE，也可以不用 Docker
+
+把 OpenWrt 直接跑成 PVE 里的独立 VM / LXC（VirtIO 网卡桥接 `vmbr0`）会省掉
+macvlan 这一层，也不用跟 NAS 耦合（NAS 挂了旁路由不受影响）。产物里的
+`rootfs.tar.gz` 可以直接给 LXC 导入，`*.img.gz` 可以转成磁盘给 VM 用。
+
+---
+
 ## 版本号机制
 
 `VERSION` 文件是唯一的版本来源，它同时决定：
