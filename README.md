@@ -20,8 +20,9 @@
 ├── build-openwrt-docker.sh      新脚本：Docker 编排 + 容器内编译
 ├── docker/
 │   ├── Dockerfile.build         编译环境镜像（只装依赖）
-│   └── Dockerfile.image         产物镜像（OpenWrt rootfs，FROM scratch）
-├── docker-compose.yml           部署 OpenWrt 容器
+│   ├── Dockerfile.image         产物镜像（OpenWrt rootfs，FROM scratch）
+│   └── entrypoint.sh            容器内把环境变量刷进 UCI，再 exec /sbin/init
+├── docker-compose.yml           部署 OpenWrt 容器（含 environment 与持久化卷）
 ├── .env.example                 部署参数模板
 └── .github/workflows/
     └── build-openwrt.yml        自动构建工作流
@@ -211,6 +212,90 @@ ip link del mv-test
 把 OpenWrt 直接跑成 PVE 里的独立 VM / LXC（VirtIO 网卡桥接 `vmbr0`）会省掉
 macvlan 这一层，也不用跟 NAS 耦合（NAS 挂了旁路由不受影响）。产物里的
 `rootfs.tar.gz` 可以直接给 LXC 导入，`*.img.gz` 可以转成磁盘给 VM 用。
+
+---
+
+## 容器部署参数（environment 覆写）
+
+`docker-compose.yml` 里的 `environment` **不是 OpenWrt 自己读的** —— 镜像的 CMD 是
+`/sbin/init`（procd），它不会去理会 Docker 注入的环境变量。
+
+所以镜像里加了一层 `/usr/bin/openwrt-entrypoint.sh`：把环境变量刷进 UCI，
+然后 `exec /sbin/init`。没有它，改 LAN IP 只能重新编译固件。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `OPENWRT_APPLY_ENV` | `auto` | 生效时机，见下 |
+| `OPENWRT_HOSTNAME` | `OpenWrt` | 主机名 |
+| `OPENWRT_TIMEZONE` / `OPENWRT_ZONENAME` | `CST-8` / `Asia/Shanghai` | 时区 |
+| `LUCI_THEME` / `LUCI_LANG` | `argon` / `zh-cn` | LuCI 主题与语言 |
+| `LAN_IP` / `LAN_NETMASK` / `LAN_GATEWAY` | `192.168.31.254` 等 | LAN 地址 |
+| `LAN_DNS` | `223.5.5.5 119.29.29.29` | 多个 DNS 用空格分隔 |
+| `ROOT_PASSWORD` | `root` | root 密码 |
+| `DOCKER_DATA_ROOT` | `/opt/docker` | 容器内 Docker 数据目录 |
+
+**生效时机**（`OPENWRT_APPLY_ENV`）：
+
+| 值 | 行为 |
+| --- | --- |
+| `auto`（默认） | 只在首次启动应用一次，之后以 LuCI 里的改动为准 |
+| `always` | 每次启动都应用，compose 里写什么就是什么 |
+| `never` | 完全不应用，交给 LuCI |
+
+> 注意 `auto` 的含义：改了 `.env` 里的 `LAN_IP` 再重启**不会生效**（配置卷里已经有值了）。
+> 想让配置文件完全说了算，就设 `OPENWRT_APPLY_ENV=always`；
+> 代价是 LuCI 里改这几项会被覆盖回去。
+>
+> **例外**：`ROOT_PASSWORD` 每次启动都设置。`/etc/shadow` 不在持久化卷里，
+> 容器重建后会回到镜像默认值，不重设就用改过的密码登不进去。
+
+---
+
+## 数据持久化
+
+插件配置全靠这些卷，**不挂的话容器一重建就全没了**：
+
+| 卷 | 容器路径 | 内容 |
+| --- | --- | --- |
+| `openwrt-config` | `/etc/config` | ★ 核心。网络、防火墙、DHCP、MosDNS、AdGuardHome、OpenClash、Dockerman 等几乎所有 UCI 配置 |
+| `openwrt-openclash` | `/etc/openclash` | OpenClash 配置、订阅、规则集（体积大，不持久化每次都要重新下载） |
+| `openwrt-nftables` | `/usr/share/nftables.d` | LuCI 防火墙自定义规则页写的 nftables 片段 |
+| `openwrt-docker` | `/opt/docker` | 容器内 Docker 的数据目录 |
+| `openwrt-log` | `/var/log` | 日志 |
+| `openwrt-root` | `/root` | root 家目录（部分插件会往里写东西） |
+
+### 为什么用命名卷而不是 `./data:/etc/config`
+
+**命名卷首次创建时，Docker 会把镜像里该目录的初始内容复制进去**，所以是安全的。
+
+**bind mount 到宿主机的空目录会直接把容器内目录"盖"成空的** ——
+`/etc/config` 变空会导致 OpenWrt 启动异常。想用 bind mount 方便备份的话，
+先把容器里的文件拷出来：
+
+```bash
+docker cp openwrt:/etc/config ./data/config
+# 然后改成 - ./data/config:/etc/config
+```
+
+### 追加其他插件目录
+
+如果发现某个插件的配置还是丢了，往 `volumes` 里加一行，并在文件末尾的
+`volumes:` 段声明即可（compose 里已留好注释）：
+
+```yaml
+      - openwrt-adguardhome:/etc/AdGuardHome
+      - openwrt-mosdns:/etc/mosdns
+```
+
+### 升级镜像时
+
+配置卷会保留旧配置，**新镜像里的默认配置不会自动覆盖进来**。
+如果升级后行为异常，`docker compose down` 后删掉对应卷重建即可（会丢配置，先备份）：
+
+```bash
+docker run --rm -v openwrt-config:/src -v "$PWD":/dst alpine \
+  tar czf /dst/openwrt-config-backup.tar.gz -C /src .
+```
 
 ---
 

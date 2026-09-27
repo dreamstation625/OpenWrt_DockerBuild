@@ -252,6 +252,10 @@ package_system_image() {
     cp "$PROJECT_DIR/docker/Dockerfile.image" "$ctx/Dockerfile"
     cp "$rootfs" "$ctx/rootfs.tar.gz"
 
+    # entrypoint 会被 COPY 进镜像，缺了它 compose 的 environment 就不生效
+    [ -f "$PROJECT_DIR/docker/entrypoint.sh" ] || die "缺少 docker/entrypoint.sh"
+    cp "$PROJECT_DIR/docker/entrypoint.sh" "$ctx/entrypoint.sh"
+
     local repo="${IMAGE_REPO}:${OPENWRT_VERSION}"
     log "正在打包 OpenWrt 系统镜像: $repo"
 
@@ -1090,27 +1094,28 @@ EOF
 cat > files/etc/uci-defaults/99-default-settings <<EOF
 #!/bin/sh
 
-PASSWD=\$(openssl passwd -1 '${ROOT_PASSWORD}')
-sed -i "s#^root::#root:\${PASSWD}:#g" /etc/shadow
+# 主机名 / 时区 / 主题 / 语言 / 密码 / LAN 在容器里由 /usr/bin/openwrt-entrypoint.sh
+# 按环境变量设置。uci-defaults 是在 /sbin/init 之后才执行的，这里如果再设一遍，
+# 会把容器里已经持久化并改过的配置覆盖掉。
+# 所以这些默认值只在物理机（刷机）场景应用，容器场景交给 entrypoint。
+if [ ! -f /.dockerenv ] && ! grep -qaE 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
+        PASSWD=\$(openssl passwd -1 '${ROOT_PASSWORD}')
+        sed -i "s#^root::#root:\${PASSWD}:#g" /etc/shadow
 
-uci set system.@system[0].hostname='OpenWrt'
-uci set system.@system[0].zonename='Asia/Shanghai'
-uci set system.@system[0].timezone='CST-8'
+        uci set system.@system[0].hostname='OpenWrt'
+        uci set system.@system[0].zonename='Asia/Shanghai'
+        uci set system.@system[0].timezone='CST-8'
 
-uci set luci.main.mediaurlbase='/luci-static/argon'
-uci set luci.main.lang='zh-cn'
-uci set luci.main.lang_auto='0'
+        uci set luci.main.mediaurlbase='/luci-static/argon'
+        uci set luci.main.lang='zh-cn'
+        uci set luci.main.lang_auto='0'
 
-uci commit system
-uci commit luci
-
-# 容器模式适配：Docker 里 eth0 由容器网络（macvlan 等）提供，无需再建 br-lan 桥
-# 桥接会把 macvlan 接口再套一层 bridge，反而导致容器内网络不通。
-if [ -f /.dockerenv ] || grep -qaE 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
-        uci -q delete network.@device[0]
-        uci set network.lan.device='eth0'
-        uci commit network
+        uci commit system
+        uci commit luci
 fi
+
+# 容器网络适配（LAN 直连 eth0、去掉 br-lan 桥）已移到 entrypoint：
+# 它在 /sbin/init 之前跑，能保证 macvlan 场景下网络正确。这里不再重复处理。
 
 if [ -f /etc/config/nginx ]; then
         uci -q delete nginx._lan.redirect_https

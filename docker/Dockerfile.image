@@ -29,11 +29,29 @@ LABEL org.opencontainers.image.title="openwrt" \
 # 解包 OpenWrt rootfs（ADD 遇到 tar.gz 会自动展开）
 ADD rootfs.tar.gz /
 
+# entrypoint：把 docker/compose 传入的环境变量刷进 UCI 再交给 /sbin/init。
+# 没有它，compose 的 environment 对 OpenWrt 完全无效。
+# --chmod 保证可执行位（仓库 core.filemode=false，clone 下来可能不带 x）
+COPY --chmod=0755 entrypoint.sh /usr/bin/openwrt-entrypoint.sh
+
 ENV PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     HOME=/root \
     TERM=xterm \
-    OPENWRT_VERSION=${OPENWRT_VERSION}
+    OPENWRT_VERSION=${OPENWRT_VERSION} \
+    OPENWRT_APPLY_ENV=auto \
+    OPENWRT_HOSTNAME=OpenWrt \
+    OPENWRT_TIMEZONE=CST-8 \
+    OPENWRT_ZONENAME=Asia/Shanghai \
+    LUCI_THEME=argon \
+    LUCI_LANG=zh-cn \
+    LAN_IP=192.168.31.254 \
+    LAN_NETMASK=255.255.255.0 \
+    LAN_GATEWAY=192.168.31.1 \
+    LAN_DNS="223.5.5.5 119.29.29.29" \
+    ROOT_PASSWORD=root \
+    DOCKER_DATA_ROOT=/opt/docker
 
 # OpenWrt 使用 procd 作为 init
 STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/openwrt-entrypoint.sh"]
 CMD ["/sbin/init"]
