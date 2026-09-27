@@ -43,7 +43,12 @@
 
 ### 1. 自动构建（推荐）
 
-改 `VERSION` 里的版本号 → 推送 → 手动触发 workflow（或打个 `v1.0.1` 的 tag）。
+推送到 `main` 就会自动触发（`docker/`、脚本、`VERSION` 等改动都算）。
+另外也支持打 tag（`git tag v1.0.1 && git push origin v1.0.1`）或
+在 Actions 页面手动 Run workflow。
+
+**想重新构建固件，改 `VERSION` 里的版本号再推送即可** —— 版本号没变的话
+闸门会直接跳过（秒级结束，不烧 Actions 时长）。
 
 工作流做的事：
 
