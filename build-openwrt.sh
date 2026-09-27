@@ -816,6 +816,48 @@ else
 fi
 
 ###############################################################################
+# 预构建 LuCI host 工具（po2lmo / jsmin）
+###############################################################################
+# 第三方 LuCI 应用（package/custom/*）在 install 阶段会直接调用 po2lmo 把
+# 中文 po 编成 lmo，但它们的 Makefile 通常没写
+#     PKG_BUILD_DEPENDS:=luci-base/host
+# make 就不会自动先把 luci-base 的 host 工具编出来。结果跑到它时才报
+#     bash: line 1: po2lmo: command not found     → Error 127
+# 而这时往往已经编译了两三个小时。这里显式先编一次，成本几秒。
+echo
+echo "================ 预构建 LuCI host 工具 ================"
+
+LUCIBASE_DIR=""
+for candidate in \
+    package/feeds/luci/luci-base \
+    package/feeds/luci/modules/luci-base \
+    package/luci-base; do
+    if [ -d "$candidate" ]; then
+        LUCIBASE_DIR="$candidate"
+        break
+    fi
+done
+
+if [ -n "$LUCIBASE_DIR" ]; then
+    if make "${LUCIBASE_DIR}/host/compile" V=s; then
+        if [ -x staging_dir/host/bin/po2lmo ]; then
+            echo "✓ po2lmo 已就绪"
+            [ -x staging_dir/host/bin/jsmin ] && echo "✓ jsmin 已就绪"
+            if ! command -v po2lmo >/dev/null 2>&1; then
+                export PATH="$PWD/staging_dir/host/bin:$PATH"
+                echo "已把 staging_dir/host/bin 加入 PATH"
+            fi
+        else
+            echo "⚠ host 工具编译完成，但 staging_dir/host/bin/po2lmo 不存在"
+        fi
+    else
+        echo "⚠ luci-base host 工具构建失败：带中文语言包的第三方 LuCI 应用可能报 po2lmo: command not found"
+    fi
+else
+    echo "⚠ 未找到 luci-base 目录，跳过 host 工具预构建"
+fi
+
+###############################################################################
 # 编译（优化：启用详细输出和错误处理）
 ###############################################################################
 

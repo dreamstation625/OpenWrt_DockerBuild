@@ -230,12 +230,19 @@ jobs:
 
       # 脚本在 CI 模式下把 make 的完整输出写进了日志文件，
       # 编译失败时把它传上来，否则 Actions 日志里看不到真正的报错。
+      #
+      # 注意路径：make 日志始终落在 work/openwrt/build-logs/ 下，
+      # 只有编译成功、跑过 collect_artifacts 之后才会被复制到 output/。
+      # 失败时 output/ 里根本没有 .log，所以两边都要带上
+      # （upload-artifact 对匹配不到的路径会自动忽略，不会报错）。
       - name: 上传编译日志（失败时）
         if: failure() && steps.gate.outputs.rebuild == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: openwrt-build-logs-${{ steps.gate.outputs.version }}
-          path: output/*.log
+          path: |
+            work/openwrt/build-logs/*.log
+            output/*.log
           if-no-files-found: warn
           retention-days: 7
 
