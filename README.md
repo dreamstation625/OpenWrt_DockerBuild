@@ -21,9 +21,11 @@
 ├── docker/
 │   ├── Dockerfile.build         编译环境镜像（只装依赖）
 │   ├── Dockerfile.image         产物镜像（OpenWrt rootfs，FROM scratch）
-│   └── entrypoint.sh            容器内把环境变量刷进 UCI，再 exec /sbin/init
-├── docker-compose.yml           部署 OpenWrt 容器（含 environment 与持久化卷）
+│   ├── entrypoint.sh            容器内把环境变量刷进 UCI，再 exec /sbin/init
+│   └── init-volumes.sh          可选：起容器前预先导出默认配置到 ./data
+├── docker-compose.yml           部署 OpenWrt 容器（含 environment 与持久化挂载）
 ├── .env.example                 部署参数模板
+└── data/                        运行时生成，持久化数据（已 gitignore）
 └── .github/workflows/
     └── build-openwrt.yml        自动构建工作流
 ```
@@ -89,9 +91,13 @@
 
 ```bash
 cp .env.example .env
-vi .env          # 填 LAN_PARENT_IFACE（宿主机真实网卡名）和镜像 tag
+vi .env          # 填 LAN_PARENT_IFACE（宿主机真实网卡名）、镜像 tag、DATA_DIR
+
+./docker/init-volumes.sh   # 可选：预先把默认配置导出到 ./data，方便查看和备份
 docker compose up -d
 ```
+
+持久化数据在 `./data`（`.env` 里 `DATA_DIR` 可改），备份就是整目录打包。
 
 然后浏览器打开 `http://192.168.31.254`，默认账号 `root` / `root`。
 
@@ -233,6 +239,8 @@ macvlan 这一层，也不用跟 NAS 耦合（NAS 挂了旁路由不受影响）
 | `LAN_DNS` | `223.5.5.5 119.29.29.29` | 多个 DNS 用空格分隔 |
 | `ROOT_PASSWORD` | `root` | root 密码 |
 | `DOCKER_DATA_ROOT` | `/opt/docker` | 容器内 Docker 数据目录 |
+| `OPENWRT_SEED_AUTO` | `1` | 挂载目录为空时是否自动用镜像默认配置初始化，`0` 关闭 |
+| `OPENWRT_SEED_DIRS` | 见 compose | 需要初始化的目录列表（空格分隔），一般用默认值 |
 
 **生效时机**（`OPENWRT_APPLY_ENV`）：
 
@@ -253,49 +261,82 @@ macvlan 这一层，也不用跟 NAS 耦合（NAS 挂了旁路由不受影响）
 
 ## 数据持久化
 
-插件配置全靠这些卷，**不挂的话容器一重建就全没了**：
+插件配置全靠这些挂载，**不挂的话容器一重建就全没了**。
 
-| 卷 | 容器路径 | 内容 |
+用的是 **bind mount**，全部落在当前目录下的 `data/`（可用 `.env` 的
+`DATA_DIR` 改到别处，例如群晖的 `/volume1/docker/openwrt-data`）：
+
+| 宿主机目录 | 容器路径 | 内容 |
 | --- | --- | --- |
-| `openwrt-config` | `/etc/config` | ★ 核心。网络、防火墙、DHCP、MosDNS、AdGuardHome、OpenClash、Dockerman 等几乎所有 UCI 配置 |
-| `openwrt-openclash` | `/etc/openclash` | OpenClash 配置、订阅、规则集（体积大，不持久化每次都要重新下载） |
-| `openwrt-nftables` | `/usr/share/nftables.d` | LuCI 防火墙自定义规则页写的 nftables 片段 |
-| `openwrt-docker` | `/opt/docker` | 容器内 Docker 的数据目录 |
-| `openwrt-log` | `/var/log` | 日志 |
-| `openwrt-root` | `/root` | root 家目录（部分插件会往里写东西） |
+| `data/config` | `/etc/config` | ★ 核心。网络、防火墙、DHCP、MosDNS、AdGuardHome、OpenClash、Dockerman 等几乎所有 UCI 配置 |
+| `data/openclash` | `/etc/openclash` | OpenClash 配置、订阅、规则集（体积大，不持久化每次都要重新下载） |
+| `data/adguardhome` | `/etc/AdGuardHome` | AdGuard Home 过滤规则、统计数据库 |
+| `data/mosdns` | `/etc/mosdns` | MosDNS 分流规则与自定义配置 |
+| `data/nftables.d` | `/usr/share/nftables.d` | LuCI 防火墙自定义规则页写的 nftables 片段 |
+| `data/docker` | `/opt/docker` | 容器内 Docker 的数据目录（镜像/容器都在这，会很大） |
+| `data/root` | `/root` | root 家目录（部分插件会往里写状态、SSH key） |
+| `data/log` | `/var/log` | 日志（注意见下方说明） |
 
-### 为什么用命名卷而不是 `./data:/etc/config`
+> OpenWrt 里 `/var` 是指向 `/tmp` 的符号链接，而 `/tmp` 是 tmpfs，
+> 系统日志默认仍在内存里、重启即丢。要真正落盘，在 LuCI
+> 「系统 → 系统日志」里把输出路径改到持久化目录。
 
-**命名卷首次创建时，Docker 会把镜像里该目录的初始内容复制进去**，所以是安全的。
+### bind mount 的空目录问题（已内置兜底）
 
-**bind mount 到宿主机的空目录会直接把容器内目录"盖"成空的** ——
-`/etc/config` 变空会导致 OpenWrt 启动异常。想用 bind mount 方便备份的话，
-先把容器里的文件拷出来：
+bind mount 不像命名卷那样会自动把镜像里的初始内容带出来：
+**宿主机目录为空时，挂上去会把容器内目录直接"盖"成空的**，
+`/etc/config` 一空，UCI 读不到配置，OpenWrt 起不来也进不去 LuCI。
+
+镜像已经处理了这件事：构建时把各目录的初始内容备份到
+`/usr/share/openwrt-defaults`，容器启动的 entrypoint 检测到挂载目录为空
+就自动恢复。**目录非空（说明你已经在用）则一律不动，绝不覆盖已有配置。**
+
+所以直接 `docker compose up -d` 就行。想在起容器前先看到默认配置：
 
 ```bash
-docker cp openwrt:/etc/config ./data/config
-# 然后改成 - ./data/config:/etc/config
+./docker/init-volumes.sh     # 幂等，已有内容不会覆盖
 ```
+
+想关掉自动初始化（比如要自己 `docker cp` 进来）：设 `OPENWRT_SEED_AUTO=0`。
+
+### 权限
+
+容器内以 root 运行，宿主机上这些文件属主也是 root。
+备份/编辑请用 root 或 sudo。
 
 ### 追加其他插件目录
 
-如果发现某个插件的配置还是丢了，往 `volumes` 里加一行，并在文件末尾的
-`volumes:` 段声明即可（compose 里已留好注释）：
+如果发现某个插件的配置还是丢了，往 `docker-compose.yml` 的 `volumes` 里
+照格式加一行即可（文件里已留好注释）：
 
 ```yaml
-      - openwrt-adguardhome:/etc/AdGuardHome
-      - openwrt-mosdns:/etc/mosdns
+      - ${DATA_DIR:-./data}/ddns-go:/etc/ddns-go
+      - ${DATA_DIR:-./data}/v2ray:/etc/v2ray
+```
+
+加完 `docker compose up -d` 重建容器生效（bind mount 变动需要重建）。
+
+### 备份与恢复
+
+备份就是整个目录打包拷走：
+
+```bash
+# 备份
+docker compose down
+tar czf openwrt-data-$(date +%F).tar.gz -C data .
+docker compose up -d
+
+# 恢复：停容器 → 解包覆盖 → 启动
+docker compose down
+tar xzf openwrt-data-2026-09-27.tar.gz -C data
+docker compose up -d
 ```
 
 ### 升级镜像时
 
-配置卷会保留旧配置，**新镜像里的默认配置不会自动覆盖进来**。
-如果升级后行为异常，`docker compose down` 后删掉对应卷重建即可（会丢配置，先备份）：
-
-```bash
-docker run --rm -v openwrt-config:/src -v "$PWD":/dst alpine \
-  tar czf /dst/openwrt-config-backup.tar.gz -C /src .
-```
+`data/` 会保留旧配置，**新镜像里的默认配置不会自动覆盖进来**（这是故意的）。
+升级后若行为异常，备份后清空对应子目录重启，entrypoint 会重新用新镜像的
+默认值初始化。
 
 ---
 

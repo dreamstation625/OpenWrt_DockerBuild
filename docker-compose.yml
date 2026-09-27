@@ -8,9 +8,13 @@
 # LAN_PARENT_IFACE，常见值是 eth0 / ens18 / enp3s0 / br0。
 #
 #   cp .env.example .env
-#   vi .env                 # 改 LAN_PARENT_IFACE / OPENWRT_IMAGE
+#   vi .env                 # 改 LAN_PARENT_IFACE / OPENWRT_IMAGE / DATA_DIR
+#   ./docker/init-volumes.sh   # 可选：预先把默认配置取到 ./data
 #   docker compose up -d
 #   浏览器打开 http://192.168.31.254
+#
+# 持久化数据都在 ./data（可用 .env 的 DATA_DIR 改到别处），
+# 备份就是整个目录打包拷走。
 #
 # ⚠ 为什么不推荐 host 网络：
 #   容器内的 netifd + firewall4 会直接接管宿主机网络栈，把 192.168.31.254
@@ -68,36 +72,52 @@ services:
     # ------------------------------------------------------------------
     # 持久化：插件配置全靠这些卷，不挂的话容器一重建配置就没了
     #
-    # 用的是命名卷（不是 ./data:/etc/config 这种 bind mount）：
-    #   命名卷首次创建时会把镜像里该目录的初始内容复制进去，安全；
-    #   bind mount 到宿主机空目录会直接把容器内目录"盖"成空的，
-    #   OpenWrt 会因为 /etc/config 为空而启动异常。
-    # 想改用 bind mount 方便备份的话，先把容器里的文件拷出来：
-    #   docker cp openwrt:/etc/config ./data/config
+    # 用的是 bind mount（挂载到当前目录下的 data/），备份/迁移直接拷目录即可。
+    # 根目录由 DATA_DIR 控制，默认 ./data；想放到别处就在 .env 里改，
+    # 例如群晖：DATA_DIR=/volume1/docker/openwrt-data
+    #
+    # ⚠ bind mount 不像命名卷那样会自动带入镜像内容：宿主机目录为空时，
+    #   挂上去会把容器内目录"盖"成空的，/etc/config 一空 OpenWrt 就起不来。
+    #   镜像里的 entrypoint 已内置兜底（检测到空目录就从内置默认配置恢复），
+    #   所以直接 up 也没问题。想提前看到默认配置可以跑：
+    #     ./docker/init-volumes.sh
+    #
+    # ⚠ 权限：容器内以 root 写入，宿主机上这些文件属主是 root。
+    #   备份/编辑用 root 或 sudo，别用普通用户改完再指望容器读得到。
     # ------------------------------------------------------------------
     volumes:
       # 核心：UCI 配置。绝大多数插件（网络、防火墙、DHCP、MosDNS、
       # AdGuardHome、OpenClash、Dockerman...）的设置都落在这里
-      - openwrt-config:/etc/config
+      - ${DATA_DIR:-./data}/config:/etc/config
 
       # OpenClash：配置、订阅、规则集，体积大，不持久化每次都要重新下载
-      - openwrt-openclash:/etc/openclash
+      - ${DATA_DIR:-./data}/openclash:/etc/openclash
+
+      # AdGuard Home：过滤规则、统计数据库
+      - ${DATA_DIR:-./data}/adguardhome:/etc/AdGuardHome
+
+      # MosDNS：分流规则与自定义配置
+      - ${DATA_DIR:-./data}/mosdns:/etc/mosdns
 
       # LuCI 防火墙自定义规则页写的 nftables 片段
-      - openwrt-nftables:/usr/share/nftables.d
+      - ${DATA_DIR:-./data}/nftables.d:/usr/share/nftables.d
 
-      # 容器内 Docker 的数据目录
-      - openwrt-docker:${DOCKER_DATA_ROOT:-/opt/docker}
+      # 容器内 Docker 的数据目录（镜像、容器、卷都在这里，会很大）
+      - ${DATA_DIR:-./data}/docker:${DOCKER_DATA_ROOT:-/opt/docker}
 
-      # 日志与 root 家目录（部分插件会往里写东西）
-      - openwrt-log:/var/log
-      - openwrt-root:/root
+      # root 家目录（部分插件会往里写状态、SSH key 等）
+      - ${DATA_DIR:-./data}/root:/root
+
+      # 日志。注意 OpenWrt 里 /var 是指向 /tmp 的符号链接，而 /tmp 是 tmpfs，
+      # 系统日志默认仍在内存里，重启即丢。要真正持久化需在 LuCI
+      # 「系统 → 系统日志」把输出改到持久化路径。
+      - ${DATA_DIR:-./data}/log:/var/log
 
       #
-      # 如果发现某个插件的配置还是丢了，往上面加一行即可，例如：
+      # 如果发现某个插件的配置还是丢了，照格式往上面加一行即可，例如：
       #
-      #   - openwrt-adguardhome:/etc/AdGuardHome
-      #   - openwrt-mosdns:/etc/mosdns
+      #   - ${DATA_DIR:-./data}/ddns-go:/etc/ddns-go
+      #   - ${DATA_DIR:-./data}/v2ray:/etc/v2ray
       #
 
     networks:
@@ -121,12 +141,17 @@ networks:
     #   external: true
     #   name: openwrt-lan
 
-volumes:
-  openwrt-config:
-  openwrt-openclash:
-  openwrt-nftables:
-  openwrt-docker:
-  openwrt-log:
-  openwrt-root:
-  # openwrt-adguardhome:
-  # openwrt-mosdns:
+# 持久化用的是 bind mount（上面的 ./data/...），所以不再声明命名卷。
+#
+# 想改回命名卷的话，把 volumes 里的 ${DATA_DIR:-./data}/config 换成
+# openwrt-config 之类，并在这里声明：
+#
+# volumes:
+#   openwrt-config:
+#   openwrt-openclash:
+#   openwrt-adguardhome:
+#   openwrt-mosdns:
+#   openwrt-nftables:
+#   openwrt-docker:
+#   openwrt-log:
+#   openwrt-root:

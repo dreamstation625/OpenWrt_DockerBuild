@@ -34,11 +34,34 @@ ADD rootfs.tar.gz /
 # --chmod 保证可执行位（仓库 core.filemode=false，clone 下来可能不带 x）
 COPY --chmod=0755 entrypoint.sh /usr/bin/openwrt-entrypoint.sh
 
+# 备份各持久化目录的初始内容。
+#
+# 为什么需要：compose 用的是 bind mount（挂载到宿主机当前目录下的 data/）。
+# 命名卷首次创建时 Docker 会自动把镜像内容复制进去，bind mount 不会 ——
+# 宿主机目录是空的，挂上去就直接把容器内目录"盖"成空的。
+# /etc/config 一空，UCI 读不到任何配置，OpenWrt 起不来也进不去 LuCI。
+#
+# 所以构建时先把初始内容存一份，entrypoint 启动时发现挂载目录为空就恢复。
+# 目录已非空（说明用户已经在用、或之前恢复过）则不动，绝不覆盖已有配置。
+#
+# 显式写 /bin/sh：本镜像 FROM scratch，ADD rootfs 之后才存在 shell，
+# 不指定绝对路径的话 Docker 会用默认的 /bin/sh -c，路径一致但显式更稳。
+RUN ["/bin/sh", "-c", "set -eu; \
+    mkdir -p /usr/share/openwrt-defaults; \
+    for d in /etc/config /etc/openclash /etc/AdGuardHome /etc/mosdns \
+             /usr/share/nftables.d /root /var/log; do \
+        n=$(printf '%s' \"$d\" | tr '/' '_'); \
+        mkdir -p \"$d\"; \
+        cp -a \"$d\" \"/usr/share/openwrt-defaults/$n\"; \
+    done; \
+    rm -f /usr/share/openwrt-defaults/_etc_config/.docker-env-applied"]
+
 ENV PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     HOME=/root \
     TERM=xterm \
     OPENWRT_VERSION=${OPENWRT_VERSION} \
     OPENWRT_APPLY_ENV=auto \
+    OPENWRT_SEED_AUTO=1 \
     OPENWRT_HOSTNAME=OpenWrt \
     OPENWRT_TIMEZONE=CST-8 \
     OPENWRT_ZONENAME=Asia/Shanghai \

@@ -15,10 +15,20 @@
 #
 # 例外：root 密码每次启动都设置。/etc/shadow 通常不在持久化卷里，
 #       容器重建后会回到镜像默认值，不重设就用改过的密码登不进去。
+#
+# 另外负责"空卷初始化"：compose 用 bind mount（挂载宿主机 data/ 目录），
+# 而 bind mount 不像命名卷那样会自动带入镜像里的初始内容。宿主机目录为空
+# 时，容器内 /etc/config 会被盖成空的，UCI 读不到配置、LuCI 进不去。
+# 所以启动先检查：挂载目录为空就从镜像内置的
+# /usr/share/openwrt-defaults（构建时备份）恢复初始内容。
+# 目录已非空 = 用户已在使用，一律不动，绝不覆盖已有配置。
 ###############################################################################
 set -u
 
 MARK=/etc/config/.docker-env-applied
+DEFAULTS_DIR=/usr/share/openwrt-defaults
+
+log() { printf 'openwrt-entrypoint: %s\n' "$*"; }
 
 uci_set() {
     # uci_set <config> <section> <option> <value>
@@ -124,7 +134,53 @@ apply_all() {
 }
 
 # ---------------------------------------------------------------------------
+# 空卷初始化：bind mount 到宿主机空目录时恢复镜像内的初始内容
+# ---------------------------------------------------------------------------
+seed_dir() {
+    # seed_dir <容器内目录>
+    target="$1"
+    src="${DEFAULTS_DIR}/$(printf '%s' "$target" | tr '/' '_')"
+
+    # 镜像里没备份过（构建时该目录不存在或被裁掉）→ 只保证目录存在
+    if [ ! -d "$src" ]; then
+        mkdir -p "$target" 2>/dev/null || true
+        return 0
+    fi
+
+    mkdir -p "$target" 2>/dev/null || true
+
+    # 非空 = 已在使用，直接跳过。这一步是安全底线，不能覆盖用户配置。
+    # 注意必须判断"输出是否为空"而不是 ls 的退出码：
+    # ls -A 对空目录同样返回 0（成功列出了零个条目），用退出码判断会
+    # 误以为目录非空，导致初始化永远不触发。
+    if [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
+        return 0
+    fi
+
+    cp -a "$src/." "$target/" 2>/dev/null || true
+    log "初始化空挂载目录 ${target}（从镜像内置默认配置恢复）"
+}
+
+seed_volumes() {
+    # 关掉就完全不自动初始化（比如你想自己 docker cp 进来）
+    case "${OPENWRT_SEED_AUTO:-1}" in
+        0|no|false|never) return 0 ;;
+    esac
+    [ -d "$DEFAULTS_DIR" ] || return 0
+
+    dirs="${OPENWRT_SEED_DIRS:-/etc/config /etc/openclash /etc/AdGuardHome /etc/mosdns /usr/share/nftables.d /root /var/log}"
+    [ -n "${DOCKER_DATA_ROOT:-}" ] && dirs="${dirs} ${DOCKER_DATA_ROOT}"
+
+    for d in $dirs; do
+        seed_dir "$d"
+    done
+}
+
+# ---------------------------------------------------------------------------
 main() {
+    # 必须在所有 UCI 操作之前：/etc/config 若为空，uci 什么都读不到
+    seed_volumes
+
     # 密码不进 /etc/config，容器重建就丢，所以每次都要设
     set_root_password
 
