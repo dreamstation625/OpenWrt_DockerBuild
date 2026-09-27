@@ -40,7 +40,10 @@ DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-/opt/docker}"
 MAPPINGS=(
     "config:/etc/config"
     "openclash:/etc/openclash"
-    "adguardhome:/etc/AdGuardHome"
+    # AdGuard Home 用官方 adguardhome 包，路径是全小写 /etc/adguardhome；
+    # 运行时数据（过滤规则、统计库）在 /var/lib/adguardhome，必须持久化
+    "adguardhome:/etc/adguardhome"
+    "adguardhome-data:/var/lib/adguardhome"
     "mosdns:/etc/mosdns"
     "nftables.d:/usr/share/nftables.d"
     "docker:${DOCKER_DATA_ROOT}"

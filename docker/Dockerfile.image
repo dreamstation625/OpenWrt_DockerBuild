@@ -48,8 +48,8 @@ COPY --chmod=0755 entrypoint.sh /usr/bin/openwrt-entrypoint.sh
 # 不指定绝对路径的话 Docker 会用默认的 /bin/sh -c，路径一致但显式更稳。
 RUN ["/bin/sh", "-c", "set -eu; \
     mkdir -p /usr/share/openwrt-defaults; \
-    for d in /etc/config /etc/openclash /etc/AdGuardHome /etc/mosdns \
-             /usr/share/nftables.d /root /var/log; do \
+    for d in /etc/config /etc/openclash /etc/adguardhome /var/lib/adguardhome \
+             /etc/mosdns /usr/share/nftables.d /root /var/log; do \
         n=$(printf '%s' \"$d\" | tr '/' '_'); \
         mkdir -p \"$d\"; \
         cp -a \"$d\" \"/usr/share/openwrt-defaults/$n\"; \

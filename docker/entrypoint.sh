@@ -168,7 +168,7 @@ seed_volumes() {
     esac
     [ -d "$DEFAULTS_DIR" ] || return 0
 
-    dirs="${OPENWRT_SEED_DIRS:-/etc/config /etc/openclash /etc/AdGuardHome /etc/mosdns /usr/share/nftables.d /root /var/log}"
+    dirs="${OPENWRT_SEED_DIRS:-/etc/config /etc/openclash /etc/adguardhome /var/lib/adguardhome /etc/mosdns /usr/share/nftables.d /root /var/log}"
     [ -n "${DOCKER_DATA_ROOT:-}" ] && dirs="${dirs} ${DOCKER_DATA_ROOT}"
 
     for d in $dirs; do

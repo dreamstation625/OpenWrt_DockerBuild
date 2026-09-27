@@ -185,7 +185,7 @@ docker run -d --name openwrt --restart unless-stopped \
   --network openwrt-lan --ip 192.168.31.254 \
   --cap-add NET_ADMIN --cap-add NET_RAW \
   --sysctl net.ipv4.ip_forward=1 \
-  dreamstation625/openwrt:1.0.0
+  dreamstation625/openwrt:1.0.1
 ```
 
 **群晖自己访问不了 `192.168.31.254`**（macvlan 固有行为），要加子接口：
@@ -275,7 +275,8 @@ macvlan 这一层，也不用跟 NAS 耦合（NAS 挂了旁路由不受影响）
 | --- | --- | --- |
 | `data/config` | `/etc/config` | ★ 核心。网络、防火墙、DHCP、MosDNS、AdGuardHome、OpenClash、Dockerman 等几乎所有 UCI 配置 |
 | `data/openclash` | `/etc/openclash` | OpenClash 配置、订阅、规则集（体积大，不持久化每次都要重新下载） |
-| `data/adguardhome` | `/etc/AdGuardHome` | AdGuard Home 过滤规则、统计数据库 |
+| `data/adguardhome` | `/etc/adguardhome` | AdGuard Home 配置文件 `adguardhome.yaml` |
+| `data/adguardhome-data` | `/var/lib/adguardhome` | AdGuard Home 过滤规则、查询日志、统计数据库（**必须挂**，见下） |
 | `data/mosdns` | `/etc/mosdns` | MosDNS 分流规则与自定义配置 |
 | `data/nftables.d` | `/usr/share/nftables.d` | LuCI 防火墙自定义规则页写的 nftables 片段 |
 | `data/docker` | `/opt/docker` | 容器内 Docker 的数据目录（镜像/容器都在这，会很大） |
@@ -285,6 +286,10 @@ macvlan 这一层，也不用跟 NAS 耦合（NAS 挂了旁路由不受影响）
 > OpenWrt 里 `/var` 是指向 `/tmp` 的符号链接，而 `/tmp` 是 tmpfs，
 > 系统日志默认仍在内存里、重启即丢。要真正落盘，在 LuCI
 > 「系统 → 系统日志」里把输出路径改到持久化目录。
+>
+> 同理，AdGuard Home 的运行数据默认落在 `/var/lib/adguardhome`（官方
+> `adguardhome` 包的位置），也在 tmpfs 里。不挂 `data/adguardhome-data`
+> 的话，**每次容器重启过滤规则和统计数据都会重建**。
 
 ### bind mount 的空目录问题（已内置兜底）
 

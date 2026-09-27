@@ -93,8 +93,13 @@ services:
       # OpenClash：配置、订阅、规则集，体积大，不持久化每次都要重新下载
       - ${DATA_DIR:-./data}/openclash:/etc/openclash
 
-      # AdGuard Home：过滤规则、统计数据库
-      - ${DATA_DIR:-./data}/adguardhome:/etc/AdGuardHome
+      # AdGuard Home（官方 adguardhome 包的路径，全小写）
+      #   /etc/adguardhome    → 配置文件 adguardhome.yaml
+      #   /var/lib/adguardhome → 过滤规则、查询日志、统计数据库
+      # 后者尤其要挂：/var 是指向 /tmp 的符号链接而在 tmpfs 里，不挂的话
+      # 每次重启 AdGuard Home 都要重建数据
+      - ${DATA_DIR:-./data}/adguardhome:/etc/adguardhome
+      - ${DATA_DIR:-./data}/adguardhome-data:/var/lib/adguardhome
 
       # MosDNS：分流规则与自定义配置
       - ${DATA_DIR:-./data}/mosdns:/etc/mosdns

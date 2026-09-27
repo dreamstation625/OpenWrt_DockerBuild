@@ -664,12 +664,35 @@ acl_path.write_text(json.dumps(data, ensure_ascii=False, indent="\t") + "\n", en
 PY
 fi
 
-# Use the classic AdGuardHome LuCI UI with core update and redirect controls.
-# The official luci feed also provides a package with the same name, so remove
-# both its source and feed symlink before adding the custom UI.
-rm -rf feeds/luci/applications/luci-app-adguardhome
-rm -rf package/feeds/luci/luci-app-adguardhome
-rm -rf tmp/info/.packageinfo-feeds_luci_luci-app-adguardhome
+# AdGuard Home 使用官方 luci feed 提供的 luci-app-adguardhome（ucode 版）。
+#
+# 早期版本这里会删掉官方包、换成 github.com/rufengsuixing/luci-app-adguardhome。
+# 那个包有两个致命问题：
+#   1. 它是旧 Lua 版 LuCI（安装到 usr/lib/lua/luci）。OpenWrt 24.10 起官方已
+#      移除 Lua 版 LuCI runtime，25.12 上即使编译通过页面也打不开。
+#   2. 它在 install 阶段直接调用 po2lmo 转换中文语言包，却没有声明
+#      PKG_BUILD_DEPENDS:=luci-base/host，make 不会先编译出这个 host 工具，
+#      导致编到它时报 po2lmo: command not found（Error 127）。
+#
+# 下面只做清理：移除历史构建目录里残留的第三方包，并把官方 feed 包恢复回来。
+if [ -d package/custom/luci-app-adguardhome ]; then
+    echo "发现残留的第三方 luci-app-adguardhome，移除（改用官方 luci feed 版本）..."
+    rm -rf package/custom/luci-app-adguardhome
+    rm -rf package/feeds/luci/luci-app-adguardhome
+    rm -rf tmp/info/.packageinfo-feeds_luci_luci-app-adguardhome
+fi
+
+# 之前跑过的构建目录里 feeds/luci/applications/luci-app-adguardhome 已被 rm -rf 删掉，
+# feeds update 不一定会补回来，这里显式恢复。
+if [ -d feeds/luci/.git ] && [ ! -d feeds/luci/applications/luci-app-adguardhome ]; then
+    echo "正在恢复 feeds/luci 里被删除的 luci-app-adguardhome..."
+    git -C feeds/luci checkout HEAD -- applications/luci-app-adguardhome 2>/dev/null || \
+        warn "无法从 feeds/luci 恢复 luci-app-adguardhome，请检查该 feed 是否完整"
+fi
+
+if [ -d feeds/luci/applications/luci-app-adguardhome ] && [ ! -e package/feeds/luci/luci-app-adguardhome ]; then
+    ./scripts/feeds install luci-app-adguardhome 2>&1 | tail -5 || true
+fi
 echo "✓ feeds 更新完成"
 
 ###############################################################################
@@ -687,12 +710,9 @@ else
     echo "✓ Argon 主题已存在，跳过克隆"
 fi
 
-echo "Installing classic AdGuardHome LuCI UI..."
-rm -rf package/custom/luci-app-adguardhome
-git clone --depth=1 \
-https://github.com/rufengsuixing/luci-app-adguardhome.git \
-package/custom/luci-app-adguardhome
-echo "Classic AdGuardHome LuCI UI installed"
+# 注：luci-app-adguardhome 用官方 luci feed 的版本（ucode 版），
+#     不再克隆第三方 github.com/rufengsuixing/luci-app-adguardhome，
+#     原因见上面 feeds 处理处的说明。
 
 # Force OpenWrt to rebuild package metadata after replacing the same-name LuCI app.
 rm -rf tmp/info tmp/.packageinfo* tmp/.config-package.in
@@ -924,6 +944,9 @@ CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-hd-idle-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-advancedplus-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-syscontrol-zh-cn=y
+# 注意：官方 luci-app-adguardhome 的 po/ 目录当前只有 templates，没有 zh-cn 翻译，
+#       因此不存在 luci-i18n-adguardhome-zh-cn 包。不能强行写上，否则 make defconfig
+#       会丢弃该行并报 "package not found" 警告。代价是该 LuCI 页面为英文界面。
 CONFIG_PACKAGE_luci-i18n-mosdns-zh-cn=y
 
 CONFIG_LUCI_LANG_zh-cn=y
@@ -1174,6 +1197,8 @@ rm -rf /tmp/luci-*
 /etc/init.d/nginx enable >/dev/null 2>&1 || true
 /etc/init.d/uhttpd enable >/dev/null 2>&1 || true
 /etc/init.d/dockerd enable >/dev/null 2>&1 || true
+# AdGuard Home：官方 adguardhome 包的 init 脚本是小写 adguardhome。
+# 大写那行是给老版本第三方包兜底的，不存在也不会报错。
 /etc/init.d/AdGuardHome enable >/dev/null 2>&1 || true
 /etc/init.d/adguardhome enable >/dev/null 2>&1 || true
 
@@ -1312,12 +1337,13 @@ ci_group_end
 ###############################################################################
 # 预构建 LuCI host 工具（po2lmo / jsmin）
 ###############################################################################
-# 第三方 LuCI 应用（package/custom/*）在 install 阶段会直接调用 po2lmo 把
-# 中文 po 编成 lmo，但它们的 Makefile 通常没写
+# 某些 LuCI 应用（尤其是 package/custom/* 里的老包）在安装阶段会直接调用
+# po2lmo 把中文 po 编成 lmo，但它们的 Makefile 没写
 #     PKG_BUILD_DEPENDS:=luci-base/host
 # make 就不会自动先把 luci-base 的 host 工具编出来。结果跑到它时才报
 #     bash: line 1: po2lmo: command not found     → Error 127
-# 而这时往往已经编译了两三个小时。这里显式先编一次，成本几秒。
+# 而这时往往已经编译了两三个小时（第一次构建就栽在这上面）。
+# 提前显式编一次，成本几秒，属于保险措施。
 ci_group_start "预构建 LuCI host 工具（po2lmo/jsmin）"
 LUCIBASE_DIR=""
 for candidate in \
