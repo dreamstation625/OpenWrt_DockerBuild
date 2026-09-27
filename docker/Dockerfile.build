@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# OpenWrt x86_64 编译环境镜像
+#
+# 只安装编译依赖，不包含源码。
+# 源码 / feeds / dl 缓存 / ccache 都放在宿主机 ./work 目录，通过 volume 挂载进
+# 容器，这样重复编译不需要重新下载和重新编译工具链。
+#
+# 构建：
+#   docker build -f docker/Dockerfile.build -t openwrt-build-env:local .
+###############################################################################
+FROM debian:bookworm-slim
+
+LABEL org.opencontainers.image.title="openwrt-build-env" \
+      org.opencontainers.image.description="OpenWrt 25.12 x86_64 build environment (deps only)" \
+      org.opencontainers.image.source="https://github.com/dreamstation625/OpenWrt_DockerBuild"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    FORCE_UNSAFE_CONFIGURE=1 \
+    LC_ALL=C \
+    LANG=C \
+    TZ=Asia/Shanghai \
+    HOME=/build \
+    USE_CCACHE=1 \
+    CCACHE_DIR=/build/.ccache \
+    CCACHE_MAXSIZE=5G
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential clang flex bison g++ gawk gcc-multilib gettext git \
+        libncurses-dev libssl-dev python3 python3-dev python3-setuptools \
+        rsync unzip zlib1g-dev file wget curl zstd libelf-dev ecj fastjar \
+        java-propose-classpath libxml-parser-perl ocaml-nox ocaml ocaml-findlib \
+        libpcre3-dev subversion swig time xsltproc openssl ccache quilt \
+        fakeroot pkg-config bzip2 bc gperf libtool-bin patch zip xxd \
+        diffutils sudo ca-certificates; \
+    (apt-get install -y --no-install-recommends python3-distutils || true); \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /build /output /src
+
+WORKDIR /build
+CMD ["bash"]

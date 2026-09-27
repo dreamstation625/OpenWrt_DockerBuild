@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# OpenWrt x86_64 系统镜像
+#
+# 构建上下文里必须同时存在：
+#   Dockerfile      本文件
+#   rootfs.tar.gz   从编译产物复制过来的 openwrt-x86-64-generic-rootfs.tar.gz
+#
+# 一般不需要手动构建，交给 build-openwrt-docker.sh --package-image 自动准备
+# 上下文并构建。
+#
+# 手动构建示例：
+#   mkdir -p /tmp/ctx && cp docker/Dockerfile.image /tmp/ctx/Dockerfile
+#   cp work/openwrt/bin/targets/x86/64/openwrt-x86-64-generic-rootfs.tar.gz \
+#      /tmp/ctx/rootfs.tar.gz
+#   docker build -f /tmp/ctx/Dockerfile --build-arg OPENWRT_VERSION=1.0.0 \
+#      -t dreamstation625/openwrt:1.0.0 /tmp/ctx
+###############################################################################
+FROM scratch
+
+ARG OPENWRT_VERSION=unknown
+ARG OPENWRT_BRANCH=openwrt-25.12
+
+LABEL org.opencontainers.image.title="openwrt" \
+      org.opencontainers.image.description="OpenWrt x86_64 (${OPENWRT_BRANCH}) - LuCI + Argon + AdGuardHome + MosDNS + OpenClash + Docker" \
+      org.opencontainers.image.version="${OPENWRT_VERSION}" \
+      org.opencontainers.image.source="https://github.com/dreamstation625/OpenWrt_DockerBuild"
+
+# 解包 OpenWrt rootfs（ADD 遇到 tar.gz 会自动展开）
+ADD rootfs.tar.gz /
+
+ENV PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/root \
+    TERM=xterm \
+    OPENWRT_VERSION=${OPENWRT_VERSION}
+
+# OpenWrt 使用 procd 作为 init
+STOPSIGNAL SIGTERM
+CMD ["/sbin/init"]

@@ -1,0 +1,227 @@
+###############################################################################
+# OpenWrt x86_64 自动构建
+#
+# 流程：
+#   1. 读取版本号（VERSION 文件 / git tag / 手动输入）
+#   2. 查 Docker Hub 上有没有 <用户名>/openwrt:<版本号>
+#        - 有 → 直接跳过（版本号没变，不重复编译，秒级结束）
+#        - 无 → 继续编译
+#   3. 用 docker buildx 构建编译环境镜像（GHA 层缓存，依赖只装一次）
+#   4. 在容器内编译 OpenWrt（dl 源码包 + ccache 走 actions/cache）
+#   5. 打包成 OpenWrt 系统镜像并推送到 Docker Hub
+#   6. 刷机固件上传 Artifact / GitHub Release
+#
+# 依赖的环境配置（仓库 Settings → Environments，环境名需与下方 environment 一致）：
+#   Variables: DOCKERHUB_USERNAME
+#   Secrets:   DOCKERHUB_TOKEN
+###############################################################################
+name: Build OpenWrt x86_64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '镜像版本号（留空则用仓库根目录 VERSION 文件）'
+        required: false
+        default: ''
+      force_rebuild:
+        description: '强制重新编译（忽略 Docker Hub 上已存在的同名 tag）'
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  IMAGE_NAME: openwrt
+  BUILD_MODE: '0'
+  CCACHE_MAXSIZE: 3G
+
+concurrency:
+  group: openwrt-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # ⚠ 这里必须和「仓库 Settings → Environments」里配置的环境名一致，
+    #   否则 vars.DOCKERHUB_USERNAME / secrets.DOCKERHUB_TOKEN 取不到值
+    environment: dockerhub
+    timeout-minutes: 350
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 版本号闸门
+      # -----------------------------------------------------------------------
+      - name: 解析版本号并检查 Docker Hub
+        id: gate
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="$INPUT_VERSION"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="$(tr -d ' \t\r\n' < VERSION)"
+          fi
+          [ -n "$VERSION" ] || { echo "::error::版本号为空"; exit 1; }
+
+          IMAGE="${DOCKERHUB_USERNAME}/${IMAGE_NAME}"
+          {
+            echo "version=$VERSION"
+            echo "image=$IMAGE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "目标镜像: ${IMAGE}:${VERSION}"
+
+          if [ "${FORCE_REBUILD:-false}" = "true" ]; then
+            echo "::notice::force_rebuild=true，强制重新编译"
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${IMAGE}/tags/${VERSION}/" || echo 000)"
+          echo "Docker Hub 查询返回 HTTP $CODE"
+
+          if [ "$CODE" = "200" ]; then
+            echo "rebuild=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${IMAGE}:${VERSION} 已存在，版本号未变化，跳过本次构建"
+          else
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${IMAGE}:${VERSION} 不存在，开始新构建"
+          fi
+
+      - name: 输出跳过说明
+        if: steps.gate.outputs.rebuild != 'true'
+        run: |
+          {
+            echo "### ⏭ 已跳过构建"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 目标镜像 | \`${{ steps.gate.outputs.image }}:${{ steps.gate.outputs.version }}\` |"
+            echo "| 原因 | Docker Hub 上已存在该版本，版本号未变化 |"
+            echo ""
+            echo "想重新编译：手动触发本 workflow 并勾选 **force_rebuild**，"
+            echo "或者把仓库根目录的 \`VERSION\` 改成新版本号后再触发。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # 以下步骤仅在版本号变化 / 强制重建时执行
+      # -----------------------------------------------------------------------
+
+      - name: 释放磁盘空间
+        if: steps.gate.outputs.rebuild == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /opt/az /usr/lib/jvm
+          sudo apt-get clean
+          df -h /
+
+      - name: 配置 Buildx
+        if: steps.gate.outputs.rebuild == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      # 编译环境镜像只装依赖，靠 GHA 层缓存复用，正常情况下几秒钟完成
+      - name: 构建编译环境镜像
+        if: steps.gate.outputs.rebuild == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.build
+          tags: openwrt-build-env:ci
+          load: true
+          cache-from: type=gha,scope=openwrt-build-env
+          cache-to: type=gha,mode=max,scope=openwrt-build-env
+
+      # 源码包(dl) 与 ccache 是「重新构建要快」的关键
+      - name: 恢复源码包 / ccache 缓存
+        if: steps.gate.outputs.rebuild == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            work/openwrt/dl
+            work/.ccache
+          key: openwrt-${{ runner.os }}-${{ steps.gate.outputs.version }}-${{ hashFiles('build-openwrt-docker.sh') }}
+          restore-keys: |
+            openwrt-${{ runner.os }}-${{ steps.gate.outputs.version }}-
+            openwrt-${{ runner.os }}-
+
+      - name: 在容器内编译 OpenWrt
+        if: steps.gate.outputs.rebuild == 'true'
+        env:
+          OPENWRT_VERSION: ${{ steps.gate.outputs.version }}
+          BUILD_MODE: ${{ env.BUILD_MODE }}
+        run: |
+          ./build-openwrt-docker.sh --env-image openwrt-build-env:ci
+
+      - name: 登录 Docker Hub
+        if: steps.gate.outputs.rebuild == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 打包并推送 OpenWrt 系统镜像
+        if: steps.gate.outputs.rebuild == 'true'
+        env:
+          OPENWRT_VERSION: ${{ steps.gate.outputs.version }}
+          IMAGE_NAMESPACE: ${{ vars.DOCKERHUB_USERNAME }}
+        run: |
+          ./build-openwrt-docker.sh --package-only --push
+
+      - name: 上传刷机固件
+        if: steps.gate.outputs.rebuild == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-x86-64-${{ steps.gate.outputs.version }}
+          path: |
+            output/*.img.gz
+            output/*rootfs.tar.gz
+            output/sha256sums
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 发布 GitHub Release
+        if: steps.gate.outputs.rebuild == 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            output/*.img.gz
+            output/*rootfs.tar.gz
+          generate_release_notes: true
+
+      - name: 输出构建结果
+        if: steps.gate.outputs.rebuild == 'true'
+        run: |
+          {
+            echo "### ✅ 构建完成"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 版本号 | \`${{ steps.gate.outputs.version }}\` |"
+            echo "| 系统镜像 | \`${{ steps.gate.outputs.image }}:${{ steps.gate.outputs.version }}\` |"
+            echo "| 镜像别名 | \`${{ steps.gate.outputs.image }}:latest\` |"
+            echo ""
+            echo "部署："
+            echo ""
+            echo '```bash'
+            echo "cp .env.example .env"
+            echo "vi .env   # 填 LAN_PARENT_IFACE 与镜像 tag"
+            echo "docker compose up -d"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

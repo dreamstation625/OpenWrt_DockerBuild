@@ -1,0 +1,13 @@
+# 构建编译环境镜像时，这些目录不需要发给 docker daemon
+.git
+.github
+.workbuddy
+work
+output
+.dockerignore
+.gitignore
+.gitattributes
+*.md
+*.img
+*.img.gz
+*.tar.gz

@@ -1,0 +1,65 @@
+###############################################################################
+# OpenWrt x86_64 容器化部署
+#
+# 推荐用 macvlan：容器在局域网里就是一台独立设备，IP 固定 192.168.31.254，
+# 不占用宿主机的 80 / 443 / 53 / 67 端口。
+#
+# 使用前先确认承载网卡名（宿主机执行 ip -br link 查看），填到 .env 的
+# LAN_PARENT_IFACE，常见值是 eth0 / ens18 / enp3s0 / br0。
+#
+#   cp .env.example .env
+#   vi .env                 # 改 LAN_PARENT_IFACE / OPENWRT_IMAGE
+#   docker compose up -d
+#   浏览器打开 http://192.168.31.254
+#
+# ⚠ 为什么不推荐 host 网络：
+#   容器内的 netifd + firewall4 会直接接管宿主机网络栈，把 192.168.31.254
+#   配到宿主机网卡上，同时抢占 80/53/67 端口，可能直接把宿主机网络搞挂。
+#   除非你非常清楚在做什么，否则别用 host。
+###############################################################################
+
+services:
+  openwrt:
+    image: ${OPENWRT_IMAGE:-dreamstation625/openwrt:latest}
+    container_name: ${CONTAINER_NAME:-openwrt}
+    hostname: OpenWrt
+
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+    # OpenWrt 需要管理接口、iptables/nftables、DHCP/TFTP 等
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - NET_BIND_SERVICE
+
+    # 让容器内的 sysctl 生效（ip_forward 等由 OpenWrt 自己设置）
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.src_valid_mark: "1"
+
+    networks:
+      lan:
+        ipv4_address: ${LAN_IP:-192.168.31.254}
+
+    #
+    # 可选：需要容器重建后仍保留 LuCI 改动时打开
+    # 注意：卷一旦创建，后续镜像里新的默认配置不会自动覆盖进去
+    #
+    # volumes:
+    #   - openwrt-config:/etc/config
+    #   - openwrt-docker:/opt/docker
+
+networks:
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: ${LAN_PARENT_IFACE:-eth0}
+    ipam:
+      config:
+        - subnet: ${LAN_SUBNET:-192.168.31.0/24}
+          gateway: ${LAN_GATEWAY:-192.168.31.1}
+
+# volumes:
+#   openwrt-config:
+#   openwrt-docker:

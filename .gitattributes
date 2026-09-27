@@ -5,6 +5,13 @@
 *.sh   text eol=lf
 *.bash text eol=lf
 
+# Dockerfile / compose / CI 配置也统一 LF，避免在 Windows 上编辑后出问题
+Dockerfile*        text eol=lf
+docker-compose*.yml text eol=lf
+*.yml              text eol=lf
+VERSION            text eol=lf
+.env*              text eol=lf
+
 # OpenWrt 源码生成物
 *.bin  binary
 *.img  binary
