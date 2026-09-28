@@ -39,6 +39,10 @@
 | `work/` | OpenWrt 源码、feeds、`dl/` 源码包、ccache（复用后重新编译很快） |
 | `output/` | 固件产物（`.img.gz`、`rootfs.tar.gz` 等） |
 
+> ccache 的实际落点是 `work/openwrt/.ccache`，不是 `work/.ccache`。
+> 这是 OpenWrt `rules.mk` 里 `$(TOPDIR)/.ccache` 决定的（`TOPDIR` = 源码根目录），
+> 脚本和 workflow 都按这个路径来，别改。
+
 ---
 
 ## 快速开始
@@ -83,13 +87,12 @@
 ./build-openwrt-docker.sh --no-docker
 ```
 
-编译线程模式作为第一个参数：
+编译线程数默认等于当前 CPU 核心数，脚本不做任何按比例的换算。需要手动指定时用环境变量：
 
 ```bash
-./build-openwrt-docker.sh 0    # 自动，用满 CPU（默认）
-./build-openwrt-docker.sh 1    # 2/3 线程
-./build-openwrt-docker.sh 2    # 一半线程
-./build-openwrt-docker.sh 3    # 单线程（排查编译错误用）
+./build-openwrt-docker.sh                      # 用满 CPU 核心数（默认）
+BUILD_THREADS=2 ./build-openwrt-docker.sh      # 指定 2 线程
+BUILD_THREADS=1 ./build-openwrt-docker.sh      # 单线程（排查编译错误用）
 ```
 
 `./build-openwrt-docker.sh --help` 查看全部参数。
@@ -395,7 +398,7 @@ docker compose up -d
 | `LAN_DNS1` / `LAN_DNS2` | `223.5.5.5` / `119.29.29.29` | DNS |
 | `ROOT_PASSWORD` | `root` | root 密码 |
 | `BRANCH` | `openwrt-25.12` | OpenWrt 分支 |
-| `BUILD_MODE` | `0` | 编译线程模式（CI 里设为 `2`） |
+| `BUILD_THREADS` | CPU 核心数 | 编译线程数，留空即自动取 `nproc` |
 | `ROOTFS_PARTSIZE` | `2048` | 根分区大小（MiB），决定固件 rootfs 分区容量 |
 | `IMAGE_NAMESPACE` / `IMAGE_NAME` | `dreamstation625` / `openwrt` | 镜像仓库 |
 | `CCACHE_MAXSIZE` | `5G` | ccache 上限 |
@@ -426,8 +429,8 @@ ROOTFS_PARTSIZE=4096 ./build-openwrt-docker.sh
 **关键点**：真正跑 `make` 的是容器，所以 `CI` 标识会通过 `docker run -e` 透传进容器，
 否则容器里不会走静默逻辑。
 
-CI 里 `BUILD_MODE` 设为 `2`（一半线程）。runner 是 4 vCPU / 16G，mosdns、adguardhome
-这类 Go 包并行跑满 4 线程有 OOM 风险。
+CI 里不写死编译线程数：脚本直接取 runner 的 CPU 核心数，runner 给几核就用几核。
+需要调整时在 workflow 的编译步骤里加 `BUILD_THREADS` 环境变量即可。
 
 ---
 
@@ -454,4 +457,13 @@ OpenWrt 系统镜像。
 **Q：重新构建真的很慢怎么办？**
 正常情况只需要复用 Docker Hub 上已有的镜像，不触发编译。
 确实需要重编时，`work/` 目录（源码 + `dl/` + ccache）会保留，第二次编译比第一次快很多。
-CI 上 `dl/` 和 ccache 走 actions/cache，注意仓库缓存总量上限 10GB。
+CI 上 `dl/` 和 ccache 走 actions/cache，注意仓库缓存总量上限 10GB
+（`dl` 用固定 key 写一次就够，`ccache` 每次构建都会产生一个新条目，
+超限时 GitHub 按 LRU 淘汰最旧的那份，所以缓存池里始终保留着最新的几轮 ccache）。
+
+**Q：CI 编译超时了，为什么会连缓存和日志一起丢？**
+因为 job 级的 `timeout-minutes` 触发后 GitHub 会取消**整个作业**，后续步骤一个都不执行，
+`actions/cache` 的保存和日志上传自然都跑不到，于是下次还是纯冷编译 —— 死循环。
+现在编译步骤单独带了 `timeout-minutes: 270`（小于 job 的 350），超时时只是这一步失败，
+作业继续往下走，`always()` 的保存缓存步骤就能把已经攒下的 `dl + ccache` 存住，
+日志也会照常作为 Artifact 上传。

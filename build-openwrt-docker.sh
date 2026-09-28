@@ -16,10 +16,8 @@ export FORCE_UNSAFE_CONFIGURE=1
 #     持久化在宿主机，重复编译不需要重新下载，编译速度显著提升。
 #
 # 用法（宿主机）：
-#   ./build-openwrt-docker.sh                    # 模式 0：自动，使用全部 CPU 线程
-#   ./build-openwrt-docker.sh 1                  # 模式 1：使用 CPU 线程的 2/3
-#   ./build-openwrt-docker.sh 2                  # 模式 2：使用 CPU 线程的一半
-#   ./build-openwrt-docker.sh 3                  # 模式 3：单线程
+#   ./build-openwrt-docker.sh                    # 编译线程数 = 当前 CPU 核心数
+#   BUILD_THREADS=1 ./build-openwrt-docker.sh    # 手动指定线程数（如压到单线程排查错误）
 #
 #   --no-docker      不用 Docker，直接在宿主机编译（等价于原 build-openwrt.sh）
 #   --in-container   容器内模式，由宿主机脚本自动带上，一般不用手写
@@ -49,13 +47,12 @@ usage() {
 OpenWrt x86_64 编译脚本（Docker 版）
 
 用法（宿主机）：
-  ./build-openwrt-docker.sh [模式] [选项]
+  ./build-openwrt-docker.sh [选项]
 
-  模式：
-    0            自动，使用全部 CPU 线程（默认）
-    1            使用 CPU 线程的 2/3
-    2            使用 CPU 线程的一半
-    3            单线程
+  编译线程数默认等于当前 CPU 核心数，不做任何按比例的换算。
+  CI 里 runner 给几核就用几核；需要手动压线程数时用环境变量覆盖：
+
+      BUILD_THREADS=2 ./build-openwrt-docker.sh
 
   选项：
     --no-docker      不用 Docker，直接在宿主机编译（等价原 build-openwrt.sh）
@@ -70,10 +67,13 @@ OpenWrt x86_64 编译脚本（Docker 版）
 
 可用环境变量覆盖：
     OPENWRT_VERSION  LAN_IP  LAN_NETMASK  LAN_GATEWAY  LAN_DNS1  LAN_DNS2
-    ROOT_PASSWORD                    BUILD_MODE   DOWNLOAD_JOBS
+    ROOT_PASSWORD                    DOWNLOAD_JOBS
+    BUILD_THREADS    编译线程数（默认 = CPU 核心数）
     IMAGE_NAMESPACE  IMAGE_NAME           HOST_WORK_DIR HOST_OUTPUT_DIR
     ROOTFS_PARTSIZE  根分区大小（MiB，默认 2048）
     CCACHE_MAXSIZE   ccache 上限（默认 5G）
+                     ccache 缓存目录固定为 <work>/openwrt/.ccache
+                     （由 OpenWrt rules.mk 的 $(TOPDIR)/.ccache 决定，不要改）
     LOG_TAIL_LINES   失败时回填的日志行数（CI 默认 400，本地 120）
 
 GitHub Actions：
@@ -100,7 +100,6 @@ PACKAGE_ONLY=0
 PUSH_IMAGE=0
 INSTALL_DEPS=0
 ENV_IMAGE=""
-MODE_ARG=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -113,7 +112,6 @@ while [ $# -gt 0 ]; do
         --install-deps)  INSTALL_DEPS=1 ;;
         --env-image)     ENV_IMAGE="${2:-}"; shift ;;
         -h|--help)       usage; exit 0 ;;
-        0|1|2|3)         MODE_ARG="$1" ;;
         *) printf '错误：未知参数 %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
     esac
     shift
@@ -141,6 +139,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 ci_group_start() { [ "$IN_CI" = "1" ] && printf '::group::%s\n' "$*"; return 0; }
 ci_group_end()   { [ "$IN_CI" = "1" ] && printf '::endgroup::\n';        return 0; }
 ci_error()       { [ "$IN_CI" = "1" ] && printf '::error::%s\n' "$*";    return 0; }
+ci_warn()        { [ "$IN_CI" = "1" ] && printf '::warning::%s\n' "$*";  return 0; }
 ci_notice()      { [ "$IN_CI" = "1" ] && printf '::notice::%s\n' "$*";   return 0; }
 
 # 失败时用多大的日志尾部（行）。CI 下默认给足，本地保持精简。
@@ -195,6 +194,43 @@ fail_tail() {
     echo "===== $logfile 最后 $lines 行 ====="
     tail -n "$lines" "$logfile" || true
     echo "=================================="
+}
+
+# 打印本次编译的 ccache 命中情况，并校验缓存目录里真的有东西。
+# 「以为开了 ccache、其实一直在空转」是纯静默失败：编译不报错、日志里也看不出来，
+# 只是每次都从头编。所以这里主动把它暴露出来。
+ccache_report() {
+    [ -n "${USE_CCACHE:-}" ] || return 0
+
+    local files size
+
+    echo
+    echo "---------------- ccache 本次编译统计 ----------------"
+    ccache -s 2>/dev/null || true
+
+    if [ ! -d "$CCACHE_DIR" ]; then
+        ci_warn "ccache 缓存目录不存在: $CCACHE_DIR"
+        echo "-----------------------------------------------------"
+        return 0
+    fi
+
+    files=$(find "$CCACHE_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+    size=$(du -sh "$CCACHE_DIR" 2>/dev/null | cut -f1 || true)
+    echo "缓存目录: $CCACHE_DIR（${files:-0} 个文件，${size:-?}）"
+    if [ "$IN_CI" = "1" ]; then
+        echo "actions/cache 要缓存的路径: work/openwrt/.ccache"
+    fi
+
+    if [ "${files:-0}" -eq 0 ]; then
+        ci_warn "ccache 缓存目录是空的 → CONFIG_CCACHE 没生效或 CCACHE_DIR 路径不对，本次编译没有产生任何编译缓存"
+        # 顺手找一下别的 .ccache，路径写错时可以一眼看出来
+        find "$WORKDIR" -maxdepth 3 -type d -name '.ccache' 2>/dev/null | while IFS= read -r d; do
+            if [ "$d" != "$CCACHE_DIR" ]; then
+                echo "  ⚠ 另外发现一个 ccache 目录: $d"
+            fi
+        done
+    fi
+    echo "-----------------------------------------------------"
 }
 
 # 计算文件摘要，用于给编译环境镜像打 tag（Dockerfile 变了才重建）
@@ -354,47 +390,14 @@ ROOT_PASSWORD="${ROOT_PASSWORD:-root}"
 # 默认 2048（2G），刷机后在 LuCI 里看到的可用空间由它决定。
 ROOTFS_PARTSIZE="${ROOTFS_PARTSIZE:-2048}"
 
-# 编译优化配置
-# 用法：
-#   ./build-openwrt-docker.sh        # 默认模式 0：自动，使用全部 CPU 线程
-#   ./build-openwrt-docker.sh 1      # 模式 1：使用 CPU 线程的 2/3
-#   ./build-openwrt-docker.sh 2      # 模式 2：使用 CPU 线程的一半
-#   ./build-openwrt-docker.sh 3      # 模式 3：单线程
-# 第一个参数为编译模式；不传则默认 0。不再读取其他线程参数。
-BUILD_MODE="${BUILD_MODE:-${MODE_ARG:-0}}"
-if have nproc; then
-    CPU_THREADS="$(nproc)"
-else
-    CPU_THREADS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-fi
-
-case "$BUILD_MODE" in
-    0)
-        DEFAULT_BUILD_THREADS="$CPU_THREADS"
-        BUILD_MODE_DESC="自动"
-        ;;
-    1)
-        DEFAULT_BUILD_THREADS=$(((CPU_THREADS * 2 + 2) / 3))
-        BUILD_MODE_DESC="2/3 线程"
-        ;;
-    2)
-        DEFAULT_BUILD_THREADS=$((CPU_THREADS / 2))
-        BUILD_MODE_DESC="一半线程"
-        ;;
-    3)
-        DEFAULT_BUILD_THREADS=1
-        BUILD_MODE_DESC="单线程"
-        ;;
-    *)
-        echo "错误：未知编译模式 '$BUILD_MODE'，可选值：0=自动，1=2/3，2=一半，3=单线程"
-        exit 1
-        ;;
-esac
-
-[ "$DEFAULT_BUILD_THREADS" -lt 1 ] && DEFAULT_BUILD_THREADS=1
-[ "$DEFAULT_BUILD_THREADS" -gt "$CPU_THREADS" ] && DEFAULT_BUILD_THREADS="$CPU_THREADS"
-
-BUILD_THREADS="$DEFAULT_BUILD_THREADS"
+# 编译线程数
+#
+# 直接取 CPU 核心数，不做任何按比例的换算。
+# 原来的「模式 0/1/2/3」是按 4 核以上机器设计的，核数少的时候会算歪：
+# 2 核机器上模式 2（一半线程）得到 1 线程，反而比默认的模式 0 慢一倍，
+# 而且日志里只显示「编译模式: 2 (一半线程)」，看不出实际已经退化成单线程。
+# CI 里 runner 给几核就用几核；要改就显式设 BUILD_THREADS。
+BUILD_THREADS="${BUILD_THREADS:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
 DOWNLOAD_JOBS="${DOWNLOAD_JOBS:-8}"
 
 ###############################################################################
@@ -437,7 +440,7 @@ if [ "$IN_CONTAINER" = "0" ] && [ "$USE_DOCKER" = "1" ]; then
         -v "$PROJECT_DIR:/src:ro"
         -e "HOME=/build"
         -e "OPENWRT_VERSION=$OPENWRT_VERSION"
-        -e "BUILD_MODE=$BUILD_MODE"
+        -e "BUILD_THREADS=$BUILD_THREADS"
         -e "DOWNLOAD_JOBS=$DOWNLOAD_JOBS"
         -e "REPO_URL=$REPO_URL"
         -e "BRANCH=$BRANCH"
@@ -479,7 +482,6 @@ if [ "$IN_CONTAINER" = "0" ] && [ "$USE_DOCKER" = "1" ]; then
     echo "产品镜像  : ${IMAGE_REPO}:${OPENWRT_VERSION}"
     echo "工作目录  : $HOST_WORK_DIR -> /build"
     echo "产物目录  : $HOST_OUTPUT_DIR -> /output"
-    echo "编译模式  : $BUILD_MODE ($BUILD_MODE_DESC)"
     echo "编译线程  : $BUILD_THREADS"
     echo "下载线程  : $DOWNLOAD_JOBS"
     echo "=========================================="
@@ -512,24 +514,56 @@ fi
 echo "=========================================="
 echo "  OpenWrt 快速编译脚本（优化版）"
 echo "=========================================="
-echo "CPU 核心数: $CPU_THREADS"
-echo "编译模式: $BUILD_MODE ($BUILD_MODE_DESC)"
 echo "编译线程数: $BUILD_THREADS"
 echo "下载线程数: $DOWNLOAD_JOBS"
-if command -v ccache &>/dev/null; then
-    echo "ccache: 已启用 ✓"
+if have ccache; then
+    echo "ccache    : $(ccache --version 2>&1 | sed -n '1p')"
 else
-    echo "ccache: 未安装（建议安装以加速编译: apt install ccache）"
+    echo "ccache    : 未安装（建议安装以加速编译: apt install ccache）"
 fi
 echo "=========================================="
 echo
 
-# 启用 ccache 加速编译（如果已安装）
-if command -v ccache &>/dev/null; then
-    export USE_CCACHE=1
-    export CCACHE_DIR="$WORKDIR/.ccache"
-    export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-5G}"
-    echo "✓ ccache 已启用，缓存目录: $CCACHE_DIR"
+###############################################################################
+# ccache 编译缓存
+###############################################################################
+# 这里有两个坑，都踩过：
+#
+# 1) 只 export USE_CCACHE / CCACHE_DIR 是不够的。
+#    OpenWrt 只有在 .config 里 CONFIG_CCACHE=y 时，rules.mk 才会给编译器加
+#    ccache 前缀：
+#        ifneq ($(CONFIG_CCACHE),)
+#          TARGET_CC := ccache $(TARGET_CC)
+#          TARGET_CXX := ccache $(TARGET_CXX)
+#          HOSTCC := ccache $(HOSTCC)
+#          HOSTCXX := ccache $(HOSTCXX)
+#          export CCACHE_DIR := $(if $(call qstrip,$(CONFIG_CCACHE_DIR)),...,$(TOPDIR)/.ccache)
+#        endif
+#    少了 CONFIG_CCACHE=y，ccache 就是个永远空转的空目录（见下面 .config 的生成处）。
+#
+# 2) 缓存目录必须和 rules.mk 算出来的那个一致。
+#    TOPDIR 是源码根目录，也就是 $WORKDIR/openwrt，所以 make 里的 export 会把
+#    CCACHE_DIR 覆盖成 $WORKDIR/openwrt/.ccache —— 不是 $WORKDIR/.ccache，
+#    也会覆盖编译环境镜像里 ENV CCACHE_DIR=/build/.ccache 的那个值。
+#    两边对不上，actions/cache 就会一直去缓存一个空目录。
+#
+# 注意 CCACHE_MAXSIZE 是 ccache 自己读的环境变量，rules.mk 不碰它，要用 export。
+###############################################################################
+
+USE_CCACHE=""
+if have ccache; then
+    USE_CCACHE=1
+    CCACHE_DIR="$WORKDIR/openwrt/.ccache"
+    CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-5G}"
+    export USE_CCACHE CCACHE_DIR CCACHE_MAXSIZE
+
+    mkdir -p "$CCACHE_DIR"
+    # 顺便把上限写进缓存目录自己的 ccache.conf，这样缓存被恢复后配置也跟着回来
+    ccache -M "$CCACHE_MAXSIZE" >/dev/null 2>&1 || true
+
+    echo "✓ ccache 已启用"
+    echo "  缓存目录: $CCACHE_DIR"
+    echo "  容量上限: $CCACHE_MAXSIZE"
 fi
 
 ###############################################################################
@@ -746,6 +780,24 @@ CONFIG_TARGET_ROOTFS_TARGZ=y
 CONFIG_GRUB_IMAGES=y
 CONFIG_EFI_IMAGES=y
 CONFIG_TARGET_ROOTFS_PARTSIZE=2048
+
+###############################################################################
+# 编译加速：ccache
+###############################################################################
+# ⚠ CONFIG_CCACHE 在 Kconfig 里的定义是（config/Config-devel.in）：
+#       config CCACHE
+#           bool "Use ccache" if DEVEL
+#   提示条件带 "if DEVEL"，DEVEL=n 时这个符号不可见，make defconfig 会把
+#   CONFIG_CCACHE=y 直接抹掉（Kconfig 对不可见符号只认默认值 n）。
+#   所以必须连 CONFIG_DEVEL=y 一起给。DEVEL 只是放开「开发者选项」的提示
+#   可见性，那些选项本身都是 default n / 空，不会改变取值。
+
+CONFIG_DEVEL=y
+CONFIG_CCACHE=y
+
+# 故意不设 CONFIG_CCACHE_DIR：留空时 rules.mk 会退回默认的 $(TOPDIR)/.ccache，
+# 也就是 $WORKDIR/openwrt/.ccache，容器内外都自洽。
+# 写死一个绝对路径反而会在 --no-docker（宿主机直编）模式下对不上。
 
 ###############################################################################
 # 软件包管理：OpenWrt 25.12 使用 apk
@@ -1051,6 +1103,20 @@ echo "正在生成最终配置..."
 make defconfig
 echo "✓ 配置生成完成"
 
+# ccache 开关兜底校验。
+# make defconfig 是按 Kconfig 重新生成 .config 的，不可见的符号只认默认值。
+# 正常情况上面给了 CONFIG_DEVEL=y 就不会被抹；这里防的是以后 Kconfig 定义变了
+# 导致 ccache 又静默失效 —— 那种失败在 CI 日志里完全看不出来。
+if grep -qx 'CONFIG_CCACHE=y' .config; then
+    echo "✓ ccache 开关: CONFIG_CCACHE=y 已生效"
+else
+    ci_warn "CONFIG_CCACHE=y 被 make defconfig 抹掉了（Kconfig 定义变了？），脚本已自动补回"
+    {
+        echo ""
+        echo "CONFIG_CCACHE=y"
+    } >> .config
+fi
+
 # 构建版本号写进 .config，include/version.mk 会读取，
 # 最终体现在固件 /etc/openwrt_release 的 DISTRIB_RELEASE 上。
 {
@@ -1292,6 +1358,10 @@ echo "下载日志: $DOWNLOAD_LOG"
 echo
 
 ci_group_start "下载源码包"
+# 下载完成标记。dl 缓存用的是固定 key（actions/cache 的条目不可变，写过就改不了），
+# 所以 workflow 只在「下载真的跑完了」之后才允许保存它 —— 否则一个残缺的 dl
+# 会被永久钉死在这个 key 上，之后每轮都少几个包、每轮都重新下。
+rm -f "$WORKDIR/openwrt/.dl-complete"
 # 首次尝试并行下载
 if run_logged "$DOWNLOAD_LOG" make download -j"$DOWNLOAD_JOBS" V=s; then
     echo "✓ 所有源码包下载完成"
@@ -1305,6 +1375,7 @@ else
         die "下载失败，请检查网络连接"
     fi
 fi
+touch "$WORKDIR/openwrt/.dl-complete"
 ci_group_end
 
 ###############################################################################
@@ -1362,6 +1433,9 @@ echo "================ 开始编译 ================"
 echo "使用 $BUILD_THREADS 个编译线程"
 if [ -n "$USE_CCACHE" ]; then
     echo "ccache 已启用，将加速重复编译"
+    echo "缓存目录: $CCACHE_DIR"
+    # 计数清零，这样编译结束后的 ccache -s 只反映本次编译，便于判断缓存有没有起作用
+    ccache -z >/dev/null 2>&1 || true
 fi
 echo
 
@@ -1374,7 +1448,7 @@ echo "并行编译日志: $PARALLEL_LOG"
 echo "单线程编译日志: $SINGLE_LOG"
 echo
 
-ci_group_start "并行编译 -j${BUILD_THREADS}"
+ci_group_start "编译 -j${BUILD_THREADS}"
 if run_logged "$PARALLEL_LOG" make -j"${BUILD_THREADS}" V=s; then
     ci_group_end
     END_TIME=$(date +%s)
@@ -1386,15 +1460,29 @@ if run_logged "$PARALLEL_LOG" make -j"${BUILD_THREADS}" V=s; then
     echo "编译结束时间: $END_TIME_TEXT"
     echo "编译用时: $((ELAPSED / 3600)) 小时 $(((ELAPSED % 3600) / 60)) 分 $((ELAPSED % 60)) 秒"
     echo "编译日志: $PARALLEL_LOG"
+    ccache_report
 else
     ci_group_end
-    echo "⚠ 并行编译失败，尝试单线程编译以获取详细错误..."
-    echo
     fail_tail "$PARALLEL_LOG"
     echo
+
+    # 线程数本来就是 1 时，这里的「回退单线程」和刚才失败的是同一条命令，
+    # 重跑一遍毫无意义，只会把整个作业时间翻倍（CI 里直接撞 timeout），
+    # 所以跳过重试，直接按失败处理。
     ci_group_start "单线程编译（定位错误）"
-    if run_logged "$SINGLE_LOG" make -j1 V=s; then
-        ci_group_end
+    SINGLE_RETRY_RC=1
+    if [ "${BUILD_THREADS:-1}" -le 1 ]; then
+        echo "⚠ 当前编译线程数已经是 1，跳过重复的单线程重试"
+    else
+        echo "⚠ 编译失败，尝试单线程编译以获取详细错误..."
+        echo
+        if run_logged "$SINGLE_LOG" make -j1 V=s; then
+            SINGLE_RETRY_RC=0
+        fi
+    fi
+    ci_group_end
+
+    if [ "$SINGLE_RETRY_RC" = "0" ]; then
         END_TIME=$(date +%s)
         END_TIME_TEXT=$(date '+%Y-%m-%d %H:%M:%S')
         ELAPSED=$((END_TIME - START_TIME))
@@ -1405,8 +1493,8 @@ else
         echo "编译用时: $((ELAPSED / 3600)) 小时 $(((ELAPSED % 3600) / 60)) 分 $((ELAPSED % 60)) 秒"
         echo "并行编译日志: $PARALLEL_LOG"
         echo "单线程编译日志: $SINGLE_LOG"
+        ccache_report
     else
-        ci_group_end
         END_TIME=$(date +%s)
         END_TIME_TEXT=$(date '+%Y-%m-%d %H:%M:%S')
         ELAPSED=$((END_TIME - START_TIME))
@@ -1420,6 +1508,7 @@ else
         echo "编译用时: $((ELAPSED / 3600)) 小时 $(((ELAPSED % 3600) / 60)) 分 $((ELAPSED % 60)) 秒"
         echo "并行编译日志: $PARALLEL_LOG"
         echo "单线程编译日志: $SINGLE_LOG"
+        ccache_report
         exit 1
     fi
 fi
@@ -1477,7 +1566,7 @@ if [ "$IN_CI" = "1" ]; then
         echo "| 构建版本 | \`${OPENWRT_VERSION}\` |"
         echo "| 目标平台 | x86/64（generic） |"
         echo "| 根分区大小 | ${ROOTFS_PARTSIZE} MiB |"
-        echo "| 编译线程 | ${BUILD_THREADS}（模式 ${BUILD_MODE}：${BUILD_MODE_DESC}） |"
+        echo "| 编译线程 | ${BUILD_THREADS} |"
         echo "| 编译用时 | $((ELAPSED / 3600)) 小时 $(((ELAPSED % 3600) / 60)) 分 $((ELAPSED % 60)) 秒 |"
         echo "| 固件目录 | \`${OUTDIR}\` |"
         echo ""

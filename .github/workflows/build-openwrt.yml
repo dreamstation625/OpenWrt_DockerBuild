@@ -8,6 +8,8 @@
 #        - 无 → 继续编译
 #   3. 用 docker buildx 构建编译环境镜像（GHA 层缓存，依赖只装一次）
 #   4. 在容器内编译 OpenWrt（dl 源码包 + ccache 走 actions/cache）
+#        ⚠ 编译步骤带步骤级 timeout，超时时只判本步骤失败，作业继续走完
+#          「保存缓存」和「上传日志」，避免整轮白跑。
 #   5. 打包成 OpenWrt 系统镜像并推送到 Docker Hub
 #   6. 刷机固件上传 Artifact / GitHub Release
 #
@@ -51,10 +53,18 @@ permissions:
 
 env:
   IMAGE_NAME: openwrt
-  # runner 是 4 vCPU / 16G，用模式 2（一半线程）更稳：
-  # mosdns / adguardhome 这些 Go 包并行吃内存，跑满 4 线程有 OOM 风险。
-  BUILD_MODE: '2'
-  CCACHE_MAXSIZE: 3G
+  # 编译线程数不在这里写死：脚本直接取 runner 的 CPU 核心数。
+  # 实测本 runner 是 2 vCPU / 7.75GiB（日志里的 "CPUs: 2"），即 make -j2。
+  # 换了 larger runner 会自动跟着变，不用改这里。
+  # 需要手动压线程数时，在下面「在容器内编译 OpenWrt」步骤的 env 里加
+  # BUILD_THREADS（例如 BUILD_THREADS: '1'）。
+  #
+  # ccache 上限。注意 Actions 的缓存池是「整个仓库共用 10GB」，里面还要装
+  # dl 源码包（约 1GB）和 buildx 的层缓存（约 1.2GB），所以这里压到 2G。
+  CCACHE_MAXSIZE: 2G
+  # dl 源码包缓存的版本号。actions/cache 的条目是不可变的（写过就改不了），
+  # 所以用固定 key + 手动改这个 epoch 来强制刷新。日常不用动它。
+  DL_CACHE_EPOCH: v1
   # 编译失败时回填到 Actions 日志的尾部行数
   LOG_TAIL_LINES: '400'
 
@@ -176,26 +186,100 @@ jobs:
           cache-from: type=gha,scope=openwrt-build-env
           cache-to: type=gha,mode=max,scope=openwrt-build-env
 
-      # 源码包(dl) 与 ccache 是「重新构建要快」的关键
-      - name: 恢复源码包 / ccache 缓存
+      # -----------------------------------------------------------------------
+      # 缓存：dl 源码包 + ccache
+      #
+      # 三个前提，之前全踩反了：
+      #
+      # 1) ccache 真正的落点是 work/openwrt/.ccache，不是 work/.ccache。
+      #    OpenWrt 的 rules.mk 里写着
+      #      export CCACHE_DIR := $(if $(CONFIG_CCACHE_DIR),...,$(TOPDIR)/.ccache)
+      #    TOPDIR 是源码根目录，这个 export 会覆盖编译环境镜像里
+      #    ENV CCACHE_DIR=/build/.ccache 的值。缓存的路径必须是最终落点。
+      #
+      # 2) actions/cache 的条目「不可变」：key 一旦写过就再也更新不了。
+      #    所以 dl（内容稳定）用固定 key，写一次就够；ccache（每次都在追加）
+      #    必须用 run_id 做 key，再靠 restore-keys 前缀取最近一份。
+      #
+      # 3) 保存缓存的步骤必须在编译之后、并且用 always()。见下面的说明。
+      # -----------------------------------------------------------------------
+      - name: 恢复 dl 源码包缓存
         if: steps.gate.outputs.rebuild == 'true'
-        uses: actions/cache@v4
+        id: cache-dl
+        uses: actions/cache/restore@v4
         with:
-          path: |
-            work/openwrt/dl
-            work/.ccache
-          key: openwrt-${{ runner.os }}-${{ steps.gate.outputs.version }}-${{ hashFiles('build-openwrt-docker.sh') }}
+          path: work/openwrt/dl
+          key: openwrt-dl-${{ runner.os }}-${{ env.DL_CACHE_EPOCH }}
           restore-keys: |
-            openwrt-${{ runner.os }}-${{ steps.gate.outputs.version }}-
-            openwrt-${{ runner.os }}-
+            openwrt-dl-${{ runner.os }}-
+
+      - name: 恢复 ccache
+        if: steps.gate.outputs.rebuild == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: work/openwrt/.ccache
+          # run_attempt 也要带上：重跑（Re-run）时 run_id 不变，
+          # 只用 run_id 的话第二次保存会因为「key 已存在」而报错。
+          key: openwrt-ccache-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            openwrt-ccache-${{ runner.os }}-
 
       - name: 在容器内编译 OpenWrt
         if: steps.gate.outputs.rebuild == 'true'
+        # ⚠ 这个步骤级超时是「缓存能存下来」的关键，不能删。
+        #   job 级的 timeout-minutes: 350 一旦触发，GitHub 会直接取消整个作业，
+        #   后续步骤（包括保存缓存和上传日志）一个都不会执行 —— 上次跑了 341
+        #   分钟被取消、缓存和 make 日志全丢，就是这么来的。
+        #   换成小于 job 超时的步骤级超时后，超时只是「本步骤失败」，作业继续往下
+        #   走，下面的 always() 步骤就能把已经攒下的 dl + ccache 存住。
+        #   下次运行就是「热 dl + 部分热 ccache」，而不是又一次纯冷编译。
+        #   270 分钟 + 留 80 分钟给后面的缓存上传和打包推送。
+        timeout-minutes: 270
         env:
           OPENWRT_VERSION: ${{ steps.gate.outputs.version }}
-          BUILD_MODE: ${{ env.BUILD_MODE }}
         run: |
           ./build-openwrt-docker.sh --env-image openwrt-build-env:ci
+
+      # 编译跑完（成功或失败）先检查一下缓存目录，再决定要不要保存。
+      # dl 用的是固定 key，一旦把残缺或空的目录写进去，这个 key 就永久毒化了
+      # （缓存条目不可变，之后每轮都会少几个包、每轮都重新下），所以必须挡一下：
+      # 只有脚本在下载阶段真的跑完之后留下的 .dl-complete 标记存在时才保存。
+      - name: 检查缓存目录
+        if: always() && steps.gate.outputs.rebuild == 'true'
+        id: cache-guard
+        run: |
+          set -euo pipefail
+          mkdir -p work/openwrt/.ccache
+
+          if [ -f work/openwrt/.dl-complete ] && [ -n "$(ls -A work/openwrt/dl 2>/dev/null)" ]; then
+            echo "dl_ok=true" >> "$GITHUB_OUTPUT"
+            echo "dl/ 大小: $(du -sh work/openwrt/dl | cut -f1)"
+          else
+            echo "dl_ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::dl/ 为空或下载阶段没跑完（缺 .dl-complete 标记），跳过保存 dl 缓存，避免毒化固定 key"
+          fi
+
+          if [ -n "$(ls -A work/openwrt/.ccache 2>/dev/null)" ]; then
+            echo "ccache_ok=true" >> "$GITHUB_OUTPUT"
+            echo "ccache/ 大小: $(du -sh work/openwrt/.ccache | cut -f1)"
+          else
+            echo "ccache_ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::ccache 目录是空的，没有编译缓存可存 —— 说明 CONFIG_CCACHE 没有生效"
+          fi
+
+      - name: 保存 dl 源码包缓存
+        if: always() && steps.cache-guard.outputs.dl_ok == 'true' && steps.cache-dl.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: work/openwrt/dl
+          key: openwrt-dl-${{ runner.os }}-${{ env.DL_CACHE_EPOCH }}
+
+      - name: 保存 ccache
+        if: always() && steps.cache-guard.outputs.ccache_ok == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: work/openwrt/.ccache
+          key: openwrt-ccache-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: 登录 Docker Hub
         if: steps.gate.outputs.rebuild == 'true'
@@ -235,8 +319,12 @@ jobs:
       # 只有编译成功、跑过 collect_artifacts 之后才会被复制到 output/。
       # 失败时 output/ 里根本没有 .log，所以两边都要带上
       # （upload-artifact 对匹配不到的路径会自动忽略，不会报错）。
-      - name: 上传编译日志（失败时）
-        if: failure() && steps.gate.outputs.rebuild == 'true'
+      #
+      # 用 (failure() || cancelled()) 而不是单个 failure()：
+      # 编译步骤超时属于 failure()，但作业万一被整轮取消（cancelled()），
+      # 日志同样需要传上来 —— 上次只能看心跳、看不到 make 输出就是这个原因。
+      - name: 上传编译日志（失败或取消时）
+        if: (failure() || cancelled()) && steps.gate.outputs.rebuild == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: openwrt-build-logs-${{ steps.gate.outputs.version }}

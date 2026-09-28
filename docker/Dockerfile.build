@@ -15,6 +15,12 @@ LABEL org.opencontainers.image.title="openwrt-build-env" \
       org.opencontainers.image.description="OpenWrt 25.12 x86_64 build environment (deps only)" \
       org.opencontainers.image.source="https://github.com/dreamstation625/OpenWrt_DockerBuild"
 
+# ⚠ 下面的 CCACHE_DIR 只是兜底值，实际用不到，别照着它去对路径：
+#   - 编译脚本会显式 export CCACHE_DIR=$WORKDIR/openwrt/.ccache
+#   - 容器内 make 还会被 OpenWrt 的 rules.mk 覆盖成 $(TOPDIR)/.ccache
+#     （TOPDIR = 源码根目录）
+#   真正的落点是容器里的 /build/openwrt/.ccache，即宿主机 work/openwrt/.ccache。
+#   要调整请改 build-openwrt-docker.sh，改这里没有效果。
 ENV DEBIAN_FRONTEND=noninteractive \
     FORCE_UNSAFE_CONFIGURE=1 \
     LC_ALL=C \
