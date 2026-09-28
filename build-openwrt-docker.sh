@@ -173,7 +173,22 @@ run_logged() {
         sleep 60
         if kill -0 "$pid" 2>/dev/null; then
             elapsed=$(( $(date +%s) - start ))
-            log "[进行中] ${*} → 已跑 $((elapsed / 60)) 分 $((elapsed % 60)) 秒"
+            # 心跳不能只报时长：CI 里 make 的完整输出都写进了文件，
+            # 上一次跑了 264 分钟被超时杀掉，前台只有一堆「已跑 xx 分」，
+            # 完全看不出卡在哪个包、有没有真的在推进。
+            # 这里顺带把日志的「行数 + 最后一行」贴出来当进度条用。
+            local lines="" last=""
+            lines=$(wc -l < "$logfile" 2>/dev/null | tr -d ' ' || true)
+            last=$(tail -c 4096 "$logfile" 2>/dev/null \
+                | tr '\r' '\n' \
+                | awk 'NF { l = $0 } END { print l }' \
+                | sed 's/[^[:print:]]//g' \
+                | cut -c1-110 || true)
+            if [ -n "$last" ]; then
+                log "[进行中] ${*} → 已跑 $((elapsed / 60)) 分 $((elapsed % 60)) 秒（日志 ${lines:-?} 行）｜ 最新: $last"
+            else
+                log "[进行中] ${*} → 已跑 $((elapsed / 60)) 分 $((elapsed % 60)) 秒（日志 ${lines:-?} 行）"
+            fi
         fi
     done
     wait "$pid"
@@ -433,8 +448,14 @@ if [ "$IN_CONTAINER" = "0" ] && [ "$USE_DOCKER" = "1" ]; then
 
     mkdir -p "$HOST_WORK_DIR" "$HOST_OUTPUT_DIR"
 
+    # --name 是给「步骤超时后的清理」用的：GitHub 的步骤超时杀掉的是 docker CLI
+    # 进程，容器里的 make 并不会停 —— 它还会继续往 work/openwrt/.ccache 里写，
+    # 于是保存缓存时 tar 报 "file changed as we read it"（exit 1），
+    # 整个 ccache 一条都没存下来。workflow 的「检查缓存目录」步骤会按
+    # name=openwrt-build 前缀把残留容器 kill 掉，确保目录静止后再打包上传。
     DOCKER_RUN_ARGS=(
         --rm
+        --name "openwrt-build-$$"
         -v "$HOST_WORK_DIR:/build"
         -v "$HOST_OUTPUT_DIR:/output"
         -v "$PROJECT_DIR:/src:ro"
@@ -694,17 +715,34 @@ src-git openclash https://github.com/vernesong/OpenClash.git
 # 磁盘管理
 src-git diskman https://github.com/lisaac/luci-app-diskman.git
 
-# 高级设置
-src-git advancedplus https://github.com/sirpdboy/luci-app-advancedplus.git
-
-# 系统控制
-src-git syscontrol https://github.com/bobbyunknown/luci-app-syscontrol.git
-
 # AdGuard Home is provided by the official luci feed on openwrt-25.12
 
 # MosDNS
 src-git mosdns https://github.com/sbwml/luci-app-mosdns.git
 EOF
+
+# ⚠ advancedplus / syscontrol 故意不写成 src-git。
+#
+# 它们是「单包仓库」：Makefile 就在仓库根目录，而不是 feed 根下的子目录。
+# OpenWrt 生成包索引时（include/scan.mk 第 77 行）用这两段 sed 把
+#     feeds/<feed>/<子目录>/Makefile:<匹配到的那一行>
+# 还原成「目录名」：
+#     sed -e 's#^$(SCAN_DIR)/##' -e 's#/Makefile:.*##'
+# 对根目录即包的仓库，第一段 sed 就已经把 feeds/<feed>/ 剥掉，只剩
+#     Makefile:<匹配到的那一行>
+# 第二段 sed 再也匹配不到 `/Makefile:`，于是**整行（含空格）被当成目录名**
+# 写进 FILELIST，索引生成随之崩掉：
+#     .files-packageinfo.mk:1: *** target pattern contains no '%'.  Stop.
+# 结果 scripts/feeds install 直接
+#     Ignoring feed 'advancedplus' - index missing
+# 包被静默丢弃 —— .config 里写的 CONFIG_PACKAGE_luci-app-advancedplus=y
+# 会被 make defconfig 抹掉，固件里根本没有这个插件。
+#
+# （diskman / mosdns / openclash 都是「feed 下带子目录」的正常结构，
+#   所以匹配后能正确还原成 applications/luci-app-diskman 之类的目录名。）
+#
+# 所以这两个包和 Argon 主题一样，直接 clone 到 package/custom/ 下，
+# 走 package/ 的正常扫描路径。见下面的「第三方单包仓库」段。
 
 ci_group_start "更新并安装 feeds"
 echo "正在更新 feeds..."
@@ -785,32 +823,84 @@ if [ -d feeds/luci/applications/luci-app-adguardhome ] && [ ! -e package/feeds/l
     ./scripts/feeds install luci-app-adguardhome 2>&1 | tail -5 || true
 fi
 
-# Docker 管理界面（dockerman）已从 feeds.conf 移除。
+# dockerman 已从 feeds.conf 移除；advancedplus / syscontrol 改成了
+# package/custom/ 直接 clone（原因见文件头 feeds.conf.default 那段注释）。
 # 注意：改 feeds.conf 后 scripts/feeds update/install **不会**自动清理旧 feed，
-# 旧的 package/feeds/dockerman 符号链接会继续存在于 work/ 里并参与后续编译。
-# 所以这里显式清残留，保证增量构建时不会再编出 Docker 相关插件。
-if [ -d feeds/dockerman ] || [ -e package/feeds/dockerman ]; then
-    echo "发现已移除的 dockerman feed 残留，正在清理..."
-    rm -rf feeds/dockerman
-    rm -rf package/feeds/dockerman
-    rm -rf tmp/info/.packageinfo-feeds_dockerman*
-fi
+# 旧的 package/feeds/xxx 符号链接会继续存在于 work/ 里并参与后续编译 ——
+# 那样就会和 package/custom/ 下的同名包冲突（同一包名出现两份）。
+# 所以这里显式清残留。
+for stale_feed in dockerman advancedplus syscontrol; do
+    if [ -d "feeds/$stale_feed" ] || [ -e "package/feeds/$stale_feed" ]; then
+        echo "发现已移除的 $stale_feed feed 残留，正在清理..."
+        rm -rf "feeds/$stale_feed"
+        rm -rf "package/feeds/$stale_feed"
+        rm -rf tmp/info/.packageinfo-feeds_"$stale_feed"*
+    fi
+done
 echo "✓ feeds 更新完成"
 
 ###############################################################################
-# Argon 主题（优化：仅在不存在时克隆）
+# 第三方单包仓库（Argon 主题 / 进阶设置 / 系统控制）
 ###############################################################################
+# 这几个仓库的 Makefile 都在仓库根目录 —— 既是「包目录」也是「仓库根」。
+# 这种结构不能挂成 src-git feed（原因见上面 feeds.conf.default 那段注释），
+# 直接 clone 进 package/custom/，让 make 走 package/ 的正常扫描路径。
 
 mkdir -p package/custom
-if [ ! -d package/custom/luci-theme-argon ]; then
-    echo "正在克隆 Argon 主题..."
-    git clone --depth=1 \
-    https://github.com/jerrykuku/luci-theme-argon.git \
-    package/custom/luci-theme-argon
-    echo "✓ Argon 主题克隆完成"
-else
-    echo "✓ Argon 主题已存在，跳过克隆"
-fi
+
+# clone_custom <仓库地址> <package/custom 下的目录名>
+#
+# ⚠ 判据必须看「实质内容」（Makefile 在不在），不能只看目录是否存在。
+#   只看 [ -d ] 的话，「上次 clone 到一半留下的空目录」会被当成已就绪，
+#   包就又一次静默丢失了 —— 跟源码树那个 [ ! -d openwrt ] 是同一类坑。
+clone_custom() {
+    local url="$1" dir="$2"
+    # target 单独一行：`local a="$1" b="x/$a"` 在某些 bash 上会先把所有词展开、
+    # 再逐个赋值，于是读 $dir 时它还没定义（set -u 下直接报 unbound variable）。
+    local target="package/custom/$dir"
+    local attempt=1
+
+    if [ -f "$target/Makefile" ]; then
+        echo "✓ $dir 已就绪，跳过克隆"
+        return 0
+    fi
+    if [ -e "$target" ]; then
+        echo "⚠ $target 存在但不是完整的包（没有 Makefile），清理后重新克隆"
+        rm -rf "$target"
+    fi
+
+    echo "正在克隆 $dir ..."
+    # git clone 要求目标目录不存在或为空，所以每轮重试前都先清掉
+    while [ "$attempt" -le 3 ]; do
+        if git clone --depth=1 "$url" "$target"; then
+            break
+        fi
+        echo "⚠ $dir 克隆失败（第 $attempt 次），10 秒后重试..."
+        rm -rf "$target"
+        sleep 10
+        attempt=$((attempt + 1))
+    done
+
+    if [ ! -f "$target/Makefile" ]; then
+        # 这里必须让脚本挂掉，不能只是打个警告继续跑：
+        # 继续跑的话这个包会静默消失，而 .config 里的 CONFIG_PACKAGE_xxx=y
+        # 会被 make defconfig 抹掉，最后固件里根本没有这个插件，还看不出来。
+        warn "$dir 克隆失败（重试 3 次），仓库: $url —— 中止构建，避免固件静默缺包"
+        return 1
+    fi
+
+    echo "✓ $dir 克隆完成"
+    return 0
+}
+
+echo "正在克隆第三方单包仓库..."
+# LuCI 主题
+clone_custom https://github.com/jerrykuku/luci-theme-argon.git luci-theme-argon
+# 进阶设置（含 KUCAT 主题设置）
+clone_custom https://github.com/sirpdboy/luci-app-advancedplus.git luci-app-advancedplus
+# 系统控制（内存释放计划任务）
+clone_custom https://github.com/bobbyunknown/luci-app-syscontrol.git luci-app-syscontrol
+echo "✓ 第三方单包仓库就绪"
 
 # 注：luci-app-adguardhome 用官方 luci feed 的版本（ucode 版），
 #     不再克隆第三方 github.com/rufengsuixing/luci-app-adguardhome，

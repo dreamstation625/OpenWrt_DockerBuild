@@ -401,7 +401,7 @@ docker compose up -d
 | `BUILD_THREADS` | CPU 核心数 | 编译线程数，留空即自动取 `nproc` |
 | `ROOTFS_PARTSIZE` | `2048` | 根分区大小（MiB），决定固件 rootfs 分区容量 |
 | `IMAGE_NAMESPACE` / `IMAGE_NAME` | `dreamstation625` / `openwrt` | 镜像仓库 |
-| `CCACHE_MAXSIZE` | `5G` | ccache 上限 |
+| `CCACHE_MAXSIZE` | 本地 `5G` / CI `3G` | ccache 上限。CI 里受 10GB 缓存池限制，所以压到 3G |
 | `LOG_TAIL_LINES` | CI `400` / 本地 `120` | 编译失败时回填的日志行数 |
 
 改根分区大小不用动脚本：
@@ -464,6 +464,16 @@ CI 上 `dl/` 和 ccache 走 actions/cache，注意仓库缓存总量上限 10GB
 **Q：CI 编译超时了，为什么会连缓存和日志一起丢？**
 因为 job 级的 `timeout-minutes` 触发后 GitHub 会取消**整个作业**，后续步骤一个都不执行，
 `actions/cache` 的保存和日志上传自然都跑不到，于是下次还是纯冷编译 —— 死循环。
-现在编译步骤单独带了 `timeout-minutes: 270`（小于 job 的 350），超时时只是这一步失败，
+现在编译步骤单独带了 `timeout-minutes: 300`（小于 job 的 355），超时时只是这一步失败，
 作业继续往下走，`always()` 的保存缓存步骤就能把已经攒下的 `dl + ccache` 存住，
 日志也会照常作为 Artifact 上传。
+⚠ 改这两个值时必须保证「前置步骤 + 编译步骤 + 收尾步骤」之和小于 job 的 `timeout-minutes`
+（GitHub 硬上限 360），否则又会退化成整轮取消、缓存全丢。
+
+**Q：编译步骤超时了，为什么 ccache 还是存不下来？**
+因为超时杀掉的是 `docker run` 的 **CLI 进程**，容器里的 `make` 并不会跟着停 ——
+它还在继续往 `work/openwrt/.ccache` 里写对象。缓存上传紧接着就开始读这个目录，
+于是 tar 报 `file changed as we read it` 并以非 0 退出，整份 ccache 一条都存不住。
+破解办法是保存缓存之前先把容器停掉：脚本用 `--name openwrt-build-$$` 启动容器，
+workflow 的「检查缓存目录」步骤按 `name=openwrt-build` 前缀 `docker rm -f` 残留容器，
+确认停住之后才打包上传。

@@ -54,14 +54,25 @@ permissions:
 env:
   IMAGE_NAME: openwrt
   # 编译线程数不在这里写死：脚本直接取 runner 的 CPU 核心数。
-  # 实测本 runner 是 2 vCPU / 7.75GiB（日志里的 "CPUs: 2"），即 make -j2。
-  # 换了 larger runner 会自动跟着变，不用改这里。
+  # 实测本 runner 是 2 vCPU / 7.75GiB（日志里 docker info 的 "CPUs: 2"），即 make -j2。
+  # ⚠ 为什么不是 4 核：GitHub 对公开/私有仓库是**两张规格表** ——
+  #     公开仓库 ubuntu-latest = 4 vCPU / 16 GB
+  #     私有仓库 ubuntu-latest = 2 vCPU /  8 GB   ← 本仓库（私有）走这行
+  #   想上 4 核只有三条路：把仓库改公开 / 用 larger runner（需 Team+ 计划、按分钟计费）
+  #   / 自建 runner。换了机器这里不用改，脚本会自动跟着 nproc 走。
   # 需要手动压线程数时，在下面「在容器内编译 OpenWrt」步骤的 env 里加
   # BUILD_THREADS（例如 BUILD_THREADS: '1'）。
   #
-  # ccache 上限。注意 Actions 的缓存池是「整个仓库共用 10GB」，里面还要装
-  # dl 源码包（约 1GB）和 buildx 的层缓存（约 1.2GB），所以这里压到 2G。
-  CCACHE_MAXSIZE: 2G
+  # ccache 上限。Actions 的缓存池是「整个仓库共用 10GB」，里面还要装
+  # dl 源码包（实测 2.0G）和 buildx 的层缓存（约 1.2G）。
+  #
+  # 定 3G 的依据：第 2 轮构建跑到 264 分钟时 ccache 已攒到 1.1G，
+  # 按比例一轮完整编译大约要 2~2.5G —— 2G 会在后半程撞上限并触发清理，
+  # 那既浪费掉最该命中的对象，也让保存时的 tar 更容易遇到文件变动。
+  # 3G×2 份（本次 + 上一份）+ dl 2G + buildx 1.2G ≈ 9.2G，仍在 10GB 以内。
+  # 真要再腾空间，优先砍 dl 缓存：实测 make download -j8 只要 3 分钟，
+  # 用 2GB 缓存池换 3 分钟很不划算。
+  CCACHE_MAXSIZE: 3G
   # dl 源码包缓存的版本号。actions/cache 的条目是不可变的（写过就改不了），
   # 所以用固定 key + 手动改这个 epoch 来强制刷新。日常不用动它。
   DL_CACHE_EPOCH: v1
@@ -78,7 +89,10 @@ jobs:
     # ⚠ 必须和「仓库 Settings → Environments」里配置的环境名完全一致，
     #   否则 vars.DOCKERHUB_USERNAME / secrets.DOCKERHUB_TOKEN 取不到值
     environment: DOCKERHUB
-    timeout-minutes: 350
+    # GitHub 硬上限是 360 分钟，留一点余量。
+    # ⚠ 这个值是「兜底」：真正会先触发的是编译步骤自己的 timeout-minutes，
+    #   因为 job 级超时会把整个作业连同后面的保存缓存步骤一起取消掉。
+    timeout-minutes: 355
 
     steps:
       - name: 检出代码
@@ -227,14 +241,20 @@ jobs:
       - name: 在容器内编译 OpenWrt
         if: steps.gate.outputs.rebuild == 'true'
         # ⚠ 这个步骤级超时是「缓存能存下来」的关键，不能删。
-        #   job 级的 timeout-minutes: 350 一旦触发，GitHub 会直接取消整个作业，
-        #   后续步骤（包括保存缓存和上传日志）一个都不会执行 —— 上次跑了 341
-        #   分钟被取消、缓存和 make 日志全丢，就是这么来的。
-        #   换成小于 job 超时的步骤级超时后，超时只是「本步骤失败」，作业继续往下
-        #   走，下面的 always() 步骤就能把已经攒下的 dl + ccache 存住。
-        #   下次运行就是「热 dl + 部分热 ccache」，而不是又一次纯冷编译。
-        #   270 分钟 + 留 80 分钟给后面的缓存上传和打包推送。
-        timeout-minutes: 270
+        #   job 级的 timeout-minutes 一旦触发，GitHub 会直接取消整个作业，
+        #   后续步骤（包括保存缓存和上传日志）一个都不会执行 —— 第 1 次构建
+        #   跑了 341 分钟被整轮取消、缓存和 make 日志全丢，就是这么来的。
+        #   换成小于 job 超时的步骤级超时后，超时只判「本步骤失败」，作业继续
+        #   往下走，后面的 always() 步骤就能把已经攒下的缓存和日志存住。
+        #   实测有效：第 2 次构建编译跑到 264 分钟撞上这里的 270 分钟超时，
+        #   作业照常走完，成功存下 2.0G 的 dl 缓存、并上传了 2.2MB 的 make 日志。
+        #
+        #   270 → 300：2 核上 264 分钟编不完（138 个包），多挤 30 分钟。
+        #   约 7 分钟前置 + 300 分钟编译 = 307，离 job 的 355 还有 48 分钟余量，
+        #   足够保存缓存 + 打包推送 + 上传固件。
+        #   ⚠ 调这个值时必须保证「前置 + 本步骤 + 收尾」之和 < job 的
+        #     timeout-minutes，否则又会退化成 job 级取消、缓存全丢。
+        timeout-minutes: 300
         env:
           OPENWRT_VERSION: ${{ steps.gate.outputs.version }}
         run: |
@@ -249,6 +269,42 @@ jobs:
         id: cache-guard
         run: |
           set -euo pipefail
+
+          # ⚠ 保存缓存之前必须先把「超时后仍在跑的编译容器」杀掉。
+          #
+          # GitHub 的步骤超时杀掉的是 docker CLI 进程，容器里的 make 并不会停：
+          # 它继续往 work/openwrt/.ccache 里写对象，而缓存上传紧接着就开始了。
+          # 上一次（run 36368734756）就是这么失败的：
+          #     tar: work/openwrt/.ccache/1: file changed as we read it
+          #     Failed to save: tar failed with exit code 1
+          #     Cache save failed.
+          # 264 分钟攒下的 1.1G 编译缓存，一条都没存住。
+          #
+          # 这里按容器名前缀找残留并清理（脚本用 --name openwrt-build-$$ 启动，
+          # --rm 会在容器停止后自动删除，bind mount 的 work/ 不受影响）。
+          # 用 rm -f 而不是 kill：rm -f 是「SIGKILL + 移除」，
+          # 万一 kill 因为容器状态异常而失败，rm -f 还能兜住。
+          leftovers="$(docker ps -q --filter 'name=openwrt-build' 2>/dev/null || true)"
+          if [ -n "$leftovers" ]; then
+            echo "::warning::发现编译步骤超时后仍在运行的容器，先停止再保存缓存: $leftovers"
+            # shellcheck disable=SC2086
+            docker rm -f $leftovers || true
+
+            # 确认真的停了再往下走：tar 读的时候目录还在变的话，
+            # 缓存保存会直接失败（"file changed as we read it" → exit 1）。
+            for _ in 1 2 3 4 5 6; do
+              if [ -z "$(docker ps -q --filter 'name=openwrt-build' 2>/dev/null || true)" ]; then
+                break
+              fi
+              sleep 2
+            done
+            if [ -n "$(docker ps -q --filter 'name=openwrt-build' 2>/dev/null || true)" ]; then
+              echo "::error::残留容器仍未停止，本次 ccache 缓存很可能保存失败"
+            else
+              echo "残留容器已停止，缓存目录已静止"
+            fi
+          fi
+
           mkdir -p work/openwrt/.ccache
 
           if [ -f work/openwrt/.dl-complete ] && [ -n "$(ls -A work/openwrt/dl 2>/dev/null)" ]; then
