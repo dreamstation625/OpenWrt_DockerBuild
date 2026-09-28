@@ -557,13 +557,13 @@ if have ccache; then
     CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-5G}"
     export USE_CCACHE CCACHE_DIR CCACHE_MAXSIZE
 
-    mkdir -p "$CCACHE_DIR"
-    # 顺便把上限写进缓存目录自己的 ccache.conf，这样缓存被恢复后配置也跟着回来
-    ccache -M "$CCACHE_MAXSIZE" >/dev/null 2>&1 || true
-
     echo "✓ ccache 已启用"
     echo "  缓存目录: $CCACHE_DIR"
     echo "  容量上限: $CCACHE_MAXSIZE"
+    # ⚠ 这里故意不 mkdir / 不 ccache -M。
+    #   CCACHE_DIR 落在 $WORKDIR/openwrt/.ccache，此刻源码还没克隆，
+    #   提前 mkdir 会顺带把 $WORKDIR/openwrt/ 创建出来（见下面源码克隆处）。
+    #   真正的 mkdir 放在「源码目录就绪后」那一段。
 fi
 
 ###############################################################################
@@ -601,21 +601,83 @@ cd "$WORKDIR"
 git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$WORKDIR/openwrt" || \
     git config --global --add safe.directory "$WORKDIR/openwrt" 2>/dev/null || true
 
-if [ ! -d openwrt ]; then
-    echo "正在克隆 OpenWrt 源码（浅克隆，仅当前分支）..."
-    git clone --depth=1 --single-branch -b "$BRANCH" "$REPO_URL" openwrt
-    echo "✓ 源码克隆完成"
-else
-    echo "✓ 源码已存在，跳过克隆"
+SRC_DIR="$WORKDIR/openwrt"
+
+# ⚠ 判断「源码是否已存在」不能只看目录在不在。
+#   actions/cache 恢复 work/openwrt/dl 或 work/openwrt/.ccache 时，会把
+#   work/openwrt/ 这个父目录一并创建出来；此时目录存在、里面却只有 dl，
+#   源码一个文件都没有。旧的 [ -d openwrt ] 判定在这里判真 → 跳过克隆
+#   → 后面 ./scripts/feeds 直接 "No such file or directory"（exit 127）。
+#   所以必须检查实质内容：Makefile + scripts/ + .git 三样齐全才算可用。
+src_ready=0
+if [ -f "$SRC_DIR/Makefile" ] && [ -d "$SRC_DIR/scripts" ] && [ -d "$SRC_DIR/.git" ]; then
+    src_ready=1
 fi
 
-cd openwrt
+if [ "$src_ready" = "1" ]; then
+    echo "✓ 源码已存在，跳过克隆"
+else
+    if [ -d "$SRC_DIR" ]; then
+        echo "⚠ openwrt/ 存在但不是完整源码树（多半只有缓存恢复出来的 dl/），重新克隆"
+        echo "  目录内容: $(ls -A "$SRC_DIR" 2>/dev/null | tr '\n' ' ')"
+        # git clone 要求目标目录不存在或为空，所以先把缓存目录挪走，
+        # 克隆完再放回去 —— dl 是 actions/cache 好不容易恢复出来的，不能丢。
+        SRC_STASH="$WORKDIR/.src-stash"
+        rm -rf "$SRC_STASH"
+        mkdir -p "$SRC_STASH"
+        for d in dl .ccache; do
+            if [ -d "$SRC_DIR/$d" ]; then
+                mv "$SRC_DIR/$d" "$SRC_STASH/$d"
+                echo "  已暂存 $d，克隆后放回"
+            fi
+        done
+        rm -rf "$SRC_DIR"
+    else
+        SRC_STASH=""
+    fi
+
+    echo "正在克隆 OpenWrt 源码（浅克隆，仅当前分支）..."
+    git clone --depth=1 --single-branch -b "$BRANCH" "$REPO_URL" "$SRC_DIR"
+    echo "✓ 源码克隆完成"
+
+    if [ -n "$SRC_STASH" ]; then
+        for d in dl .ccache; do
+            if [ -d "$SRC_STASH/$d" ]; then
+                mv "$SRC_STASH/$d" "$SRC_DIR/$d"
+                echo "  已放回 $d"
+            fi
+        done
+        rm -rf "$SRC_STASH"
+    fi
+fi
+
+cd "$SRC_DIR"
+
+# ccache 目录必须等源码目录就绪之后再创建。
+# ⚠ 真实踩过的坑：原来这段 mkdir 写在上面「ccache 编译缓存」配置块里，
+#   那时源码还没克隆，而 CCACHE_DIR = $WORKDIR/openwrt/.ccache，
+#   `mkdir -p` 会连父目录 $WORKDIR/openwrt/ 一起建出来；
+#   紧接着的「源码是否已存在」判定就会为真 → 跳过克隆 → 一路跑到
+#   ./scripts/feeds: No such file or directory（exit 127）。
+#   顺序上「先有源码目录，再建缓存目录」才是对的。
+if [ -n "$USE_CCACHE" ]; then
+    mkdir -p "$CCACHE_DIR"
+    # 把上限写进缓存目录自己的 ccache.conf，这样缓存被恢复后配置也跟着回来
+    ccache -M "$CCACHE_MAXSIZE" >/dev/null 2>&1 || true
+fi
 
 # 仅在需要时更新（节省时间）
 echo "检查源码更新..."
-git fetch --depth=1 origin "$BRANCH" 2>/dev/null || true
-git reset --hard "origin/$BRANCH" 2>/dev/null || true
-echo "✓ 源码更新检查完成"
+if git rev-parse --git-dir >/dev/null 2>&1; then
+    git fetch --depth=1 origin "$BRANCH" 2>/dev/null || true
+    git reset --hard "origin/$BRANCH" 2>/dev/null || true
+    echo "✓ 源码更新检查完成"
+else
+    # 旧代码把这两条都用 || true 吞掉了，源码目录不是 git 仓库时会静默通过，
+    # 一路跑到 feeds 阶段才以一个莫名其妙的 127 报出来。这里显式喊一声。
+    echo "⚠ 源码目录不是 git 仓库，跳过更新检查"
+    ci_warn "源码目录 $SRC_DIR 不是 git 仓库，跳过更新检查"
+fi
 
 ###############################################################################
 # feeds（优化：减少清理操作，加速更新）
