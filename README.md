@@ -286,13 +286,14 @@ macvlan 这一层，也不用跟 NAS 耦合（NAS 挂了旁路由不受影响）
 | `data/root` | `/root` | root 家目录（部分插件会往里写状态、SSH key） |
 | `data/log` | `/var/log` | 日志（注意见下方说明） |
 
-> OpenWrt 里 `/var` 是指向 `/tmp` 的符号链接，而 `/tmp` 是 tmpfs，
-> 系统日志默认仍在内存里、重启即丢。要真正落盘，在 LuCI
-> 「系统 → 系统日志」里把输出路径改到持久化目录。
+> 镜像里的 `/var` 是**真实目录**（构建时开了 `CONFIG_TARGET_ROOTFS_PERSIST_VAR=y`，
+> 原因见「常见问题」里那条 `cannot overwrite non-directory .../var`），
+> 所以 `/var/lib`、`/var/log` 的内容会落在**容器可写层**里 ——
+> `docker restart` 还在，但 `docker compose down` 重建容器就没了。
+> 因此这两处都要挂出来；真要跨重建保留，靠的是宿主机上的 `data/` 目录。
 >
-> 同理，AdGuard Home 的运行数据默认落在 `/var/lib/adguardhome`（官方
-> `adguardhome` 包的位置），也在 tmpfs 里。不挂 `data/adguardhome-data`
-> 的话，**每次容器重启过滤规则和统计数据都会重建**。
+> 另外系统日志默认走的是内存环形缓冲（`logread` 读的就是它），
+> 要落盘需在 LuCI「系统 → 系统日志」把输出路径改到 `/var/log`。
 
 ### bind mount 的空目录问题（已内置兜底）
 
@@ -477,3 +478,13 @@ CI 上 `dl/` 和 ccache 走 actions/cache，注意仓库缓存总量上限 10GB
 破解办法是保存缓存之前先把容器停掉：脚本用 `--name openwrt-build-$$` 启动容器，
 workflow 的「检查缓存目录」步骤按 `name=openwrt-build` 前缀 `docker rm -f` 残留容器，
 确认停住之后才打包上传。
+
+**Q：编译报 `cp: cannot overwrite non-directory '.../root-x86/./var' with directory '...'`？**
+这是 `/var` 的类型问题，跟包本身无关。OpenWrt 默认把 `/var` 做成**指向 `tmp` 的符号链接**
+（见 `package/base-files/Makefile`），而把包复制进 `root-x86` 用的是 `cp -fpR`：
+目标是符号链接、源是目录时，`cp` 直接拒绝，于是包被判定编译失败。
+任何往 `/var` 里装目录的包都会踩（本仓库里只有 `luci-app-syscontrol`，
+它的 Makefile 里有 `$(INSTALL_DIR) $(1)/var/log`）。
+脚本已在 `.config` 里打开 `CONFIG_TARGET_ROOTFS_PERSIST_VAR=y` 让 `/var` 变成真实目录
+（`/var/run` 仍指向 `/tmp/run`），并在 `make defconfig` 之后做兜底校验。
+顺带一提，这对 Docker 镜像也更正确：否则 `/var/lib`、`/var/log` 全落在 tmpfs 里，重启即失。

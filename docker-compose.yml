@@ -95,8 +95,7 @@ services:
       # AdGuard Home（官方 adguardhome 包的路径，全小写）
       #   /etc/adguardhome    → 配置文件 adguardhome.yaml
       #   /var/lib/adguardhome → 过滤规则、查询日志、统计数据库
-      # 后者尤其要挂：/var 是指向 /tmp 的符号链接而在 tmpfs 里，不挂的话
-      # 每次重启 AdGuard Home 都要重建数据
+      # 后者尤其要挂：不挂的话数据只待在容器可写层里，`docker compose down` 重建容器就没了
       - ${DATA_DIR:-./data}/adguardhome:/etc/adguardhome
       - ${DATA_DIR:-./data}/adguardhome-data:/var/lib/adguardhome
 
@@ -109,9 +108,9 @@ services:
       # root 家目录（部分插件会往里写状态、SSH key 等）
       - ${DATA_DIR:-./data}/root:/root
 
-      # 日志。注意 OpenWrt 里 /var 是指向 /tmp 的符号链接，而 /tmp 是 tmpfs，
-      # 系统日志默认仍在内存里，重启即丢。要真正持久化需在 LuCI
-      # 「系统 → 系统日志」把输出改到持久化路径。
+      # 日志。挂出来是为了留在宿主机上、跨容器重建也能查；
+      # 系统日志本身默认还在内存环形缓冲里（`logread` 读的是它），
+      # 要真正落盘需在 LuCI「系统 → 系统日志」把输出改到 /var/log。
       - ${DATA_DIR:-./data}/log:/var/log
 
       #

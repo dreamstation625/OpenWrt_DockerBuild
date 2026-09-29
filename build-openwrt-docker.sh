@@ -933,6 +933,26 @@ CONFIG_GRUB_IMAGES=y
 CONFIG_EFI_IMAGES=y
 CONFIG_TARGET_ROOTFS_PARTSIZE=2048
 
+# ⚠ /var 默认不是真实目录，而是「指向 tmp 的符号链接」。
+#   package/base-files/Makefile 里：
+#       ifneq ($(CONFIG_TARGET_ROOTFS_PERSIST_VAR),y)
+#           rm -f $(1)/var
+#           $(LN) tmp $(1)/var            ← 默认走这条
+#       else
+#           mkdir -p $(1)/var
+#           $(LN) /tmp/run $(1)/var/run
+#       endif
+#   于是任何往 /var 里装「目录」的包，都会在把 .pkgdir 复制进 root-x86 时炸掉
+#   （$(CP) = cp -fpR，遇到「目标是符号链接、源是目录」直接拒绝）：
+#       cp: cannot overwrite non-directory '.../root-x86/./var'
+#           with directory '.../luci-app-syscontrol-1.0.1/.pkgdir/luci-app-syscontrol/./var'
+#       make[3]: *** [Makefile:89: .../.luci-app-syscontrol_installed] Error 1
+#       ERROR: package/custom/luci-app-syscontrol failed to build.
+#   luci-app-syscontrol 的 Makefile 里就有 $(INSTALL_DIR) $(1)/var/log。
+#   打开这个开关让 /var 变成真实目录（/var/run 仍指向 /tmp/run），
+#   顺带对 Docker 镜像也更正确：不然 /var/lib、/var/log 全落在 tmpfs 里，重启就没了。
+CONFIG_TARGET_ROOTFS_PERSIST_VAR=y
+
 ###############################################################################
 # 编译加速：ccache
 ###############################################################################
@@ -1209,6 +1229,8 @@ CONFIG_TARGET_ROOTFS_TARGZ=y
 # CONFIG_TARGET_ROOTFS_EXT4FS is not set
 # CONFIG_TARGET_IMAGES_PAD is not set
 CONFIG_TARGET_ROOTFS_PARTSIZE=2048
+# /var 用真实目录而不是「指向 tmp 的符号链接」，原因见上面第一段 .config 的注释
+CONFIG_TARGET_ROOTFS_PERSIST_VAR=y
 
 ###############################################################################
 # apk + 常用管理插件
@@ -1255,19 +1277,27 @@ echo "正在生成最终配置..."
 make defconfig
 echo "✓ 配置生成完成"
 
-# ccache 开关兜底校验。
+# 关键开关兜底校验。
 # make defconfig 是按 Kconfig 重新生成 .config 的，不可见的符号只认默认值。
-# 正常情况上面给了 CONFIG_DEVEL=y 就不会被抹；这里防的是以后 Kconfig 定义变了
-# 导致 ccache 又静默失效 —— 那种失败在 CI 日志里完全看不出来。
-if grep -qx 'CONFIG_CCACHE=y' .config; then
-    echo "✓ ccache 开关: CONFIG_CCACHE=y 已生效"
-else
-    ci_warn "CONFIG_CCACHE=y 被 make defconfig 抹掉了（Kconfig 定义变了？），脚本已自动补回"
-    {
-        echo ""
-        echo "CONFIG_CCACHE=y"
-    } >> .config
-fi
+# 这里守着的两个符号一旦被抹掉，报错点离这里很远、现象也完全看不出真正原因：
+#   CONFIG_CCACHE                     → ccache 空转，缓存目录永远是空的
+#   CONFIG_TARGET_ROOTFS_PERSIST_VAR  → /var 退回符号链接，往 /var 装目录的包
+#                                       在填充 root-x86 时报 cannot overwrite non-directory
+check_config_symbol() {
+    local sym="$1"
+    local why="$2"
+    if grep -qx "$sym=y" .config; then
+        echo "✓ $sym=y 已生效"
+    else
+        ci_warn "$sym=y 被 make defconfig 抹掉了（Kconfig 定义变了？），脚本已自动补回：$why"
+        {
+            echo ""
+            echo "$sym=y"
+        } >> .config
+    fi
+}
+check_config_symbol CONFIG_CCACHE "否则本次编译不会产生任何 ccache 缓存"
+check_config_symbol CONFIG_TARGET_ROOTFS_PERSIST_VAR "否则 /var 是符号链接，往 /var 装目录的包会报 cannot overwrite non-directory"
 
 # 构建版本号写进 .config，include/version.mk 会读取，
 # 最终体现在固件 /etc/openwrt_release 的 DISTRIB_RELEASE 上。
@@ -1555,17 +1585,34 @@ done
 if [ -n "$LUCIBASE_DIR" ]; then
     HOSTTOOLS_LOG="$BUILD_LOG_DIR/host-tools-${BUILD_LOG_STAMP}.log"
     if run_logged "$HOSTTOOLS_LOG" make "${LUCIBASE_DIR}/host/compile" V=s; then
-        if [ -x staging_dir/host/bin/po2lmo ]; then
-            echo "✓ po2lmo 已就绪"
-            [ -x staging_dir/host/bin/jsmin ] && echo "✓ jsmin 已就绪"
-            # 正常情况下 OpenWrt 自己会把 staging_dir/host/bin 放进 PATH。
-            # 万一没有，这里补上，避免第三方包调用 po2lmo 时找不到。
+        # ⚠ 别只查 staging_dir/host/bin。
+        #   include/host-build.mk 第 27 行：
+        #       HOST_BUILD_PREFIX?=$(if $(IS_PACKAGE_BUILD),$(STAGING_DIR_HOSTPKG),$(STAGING_DIR_HOST))
+        #   luci-base 是按「包」构建宿主工具的（IS_PACKAGE_BUILD=1），
+        #   所以它的 po2lmo 落在 staging_dir/hostpkg/bin/po2lmo，而不是 host/bin。
+        #   之前只查 host/bin，于是每一轮都误报「po2lmo 不存在」。
+        PO2LMO_BIN=""
+        for candidate in staging_dir/hostpkg/bin/po2lmo staging_dir/host/bin/po2lmo; do
+            if [ -x "$candidate" ]; then
+                PO2LMO_BIN="$candidate"
+                break
+            fi
+        done
+
+        if [ -n "$PO2LMO_BIN" ]; then
+            HOSTTOOLS_BIN="$(dirname "$PO2LMO_BIN")"
+            echo "✓ po2lmo 已就绪: $PO2LMO_BIN"
+            if [ -x "$HOSTTOOLS_BIN/jsmin" ]; then
+                echo "✓ jsmin 已就绪"
+            fi
+            # 正常情况下 rules.mk 的 TARGET_PATH_PKG 已经同时包含 host/bin 和
+            # hostpkg/bin，这里只是兜底，避免第三方包调用 po2lmo 时找不到。
             if ! command -v po2lmo >/dev/null 2>&1; then
-                export PATH="$PWD/staging_dir/host/bin:$PATH"
-                echo "已把 staging_dir/host/bin 加入 PATH"
+                export PATH="$PWD/$HOSTTOOLS_BIN:$PATH"
+                echo "已把 $HOSTTOOLS_BIN 加入 PATH"
             fi
         else
-            warn "host 工具编译完成，但 staging_dir/host/bin/po2lmo 不存在"
+            warn "host 工具编译完成，但 staging_dir/hostpkg/bin 与 staging_dir/host/bin 下都没有 po2lmo"
         fi
     else
         warn "luci-base host 工具构建失败：带中文语言包的第三方 LuCI 应用可能报 po2lmo: command not found"
